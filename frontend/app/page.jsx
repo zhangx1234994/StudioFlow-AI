@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import * as THREE from "three";
 
 const TOOLS = {
   "intro-video": {
@@ -678,57 +679,264 @@ function AssetsPage({ navigate }) {
 }
 
 function MultiAnglePad({ values, setValues, previewSrc }) {
-  const [dragging, setDragging] = useState(false);
-  const padRef = useRef(null);
+  const mountRef = useRef(null);
+  const runtimeRef = useRef(null);
 
-  const move = useCallback((event) => {
-    const pad = padRef.current;
-    if (!pad) return;
-    const rect = pad.getBoundingClientRect();
-    const x = Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width));
-    const y = Math.min(1, Math.max(0, (event.clientY - rect.top) / rect.height));
-    setValues((prev) => ({ ...prev, camera_yaw: Math.round(x * 360 - 180), camera_pitch: Math.round(45 - y * 90) }));
+  const toYaw360 = (yaw) => {
+    const raw = Number(yaw || 0);
+    const normalized = ((raw % 360) + 360) % 360;
+    return Math.round(normalized);
+  };
+  const toDistanceFactor = (distanceLabel) => {
+    if (distanceLabel === "near") return 0.6;
+    if (distanceLabel === "far") return 1.4;
+    return 1.0;
+  };
+  const toDistanceLabel = (factor) => {
+    if (factor <= 0.8) return "near";
+    if (factor >= 1.2) return "far";
+    return "medium";
+  };
+  const updateParent = useCallback((next) => {
+    setValues((prev) => {
+      const yaw360 = toYaw360(next.yaw360 ?? toYaw360(prev.camera_yaw));
+      const signedYaw = yaw360 > 180 ? yaw360 - 360 : yaw360;
+      const pitch = Math.max(-30, Math.min(60, Math.round(next.pitch ?? prev.camera_pitch ?? 0)));
+      const distanceFactor = Math.max(0.6, Math.min(1.4, Number(next.distanceFactor ?? toDistanceFactor(prev.camera_distance))));
+      return {
+        ...prev,
+        camera_yaw: signedYaw,
+        camera_pitch: pitch,
+        camera_distance: toDistanceLabel(distanceFactor),
+      };
+    });
   }, [setValues]);
 
-  const perspective = values.camera_focal_mm === "35" ? 520 : values.camera_focal_mm === "85" ? 920 : 720;
-  const scale = values.camera_distance === "near" ? 1.12 : values.camera_distance === "far" ? 0.9 : 1;
+  useEffect(() => {
+    const mount = mountRef.current;
+    if (!mount) return;
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x12151f);
+    const camera = new THREE.PerspectiveCamera(50, mount.clientWidth / mount.clientHeight, 0.1, 100);
+    camera.position.set(4.8, 3.2, 4.8);
+    camera.lookAt(0, 0.8, 0);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(mount.clientWidth, mount.clientHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    mount.innerHTML = "";
+    mount.appendChild(renderer.domElement);
+
+    scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+    const dir = new THREE.DirectionalLight(0xffffff, 0.6);
+    dir.position.set(3, 6, 2);
+    scene.add(dir);
+    scene.add(new THREE.GridHelper(10, 20, 0x2b3244, 0x1f2431));
+
+    const center = new THREE.Vector3(0, 0.8, 0);
+    const AZ = 2.35;
+    const EL = 1.8;
+
+    const ring = new THREE.Mesh(
+      new THREE.TorusGeometry(AZ, 0.04, 16, 96),
+      new THREE.MeshStandardMaterial({ color: 0x20ffc0, emissive: 0x20ffc0, emissiveIntensity: 0.35 })
+    );
+    ring.rotation.x = Math.PI / 2;
+    ring.position.y = 0.06;
+    scene.add(ring);
+
+    const arcPoints = [];
+    for (let i = 0; i <= 40; i += 1) {
+      const angle = THREE.MathUtils.degToRad(-30 + (90 * i) / 40);
+      arcPoints.push(new THREE.Vector3(-0.8, EL * Math.sin(angle) + center.y, EL * Math.cos(angle)));
+    }
+    const arc = new THREE.Mesh(
+      new THREE.TubeGeometry(new THREE.CatmullRomCurve3(arcPoints), 40, 0.04, 8, false),
+      new THREE.MeshStandardMaterial({ color: 0xff79cc, emissive: 0xff79cc, emissiveIntensity: 0.35 })
+    );
+    scene.add(arc);
+
+    const distRail = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.03, 0.03, 2.2, 12),
+      new THREE.MeshStandardMaterial({ color: 0xffc857, emissive: 0xffc857, emissiveIntensity: 0.25 })
+    );
+    distRail.rotation.z = Math.PI / 2;
+    distRail.position.set(-2.15, center.y, 0);
+    scene.add(distRail);
+
+    const mkHandle = (color, type) => {
+      const mesh = new THREE.Mesh(
+        new THREE.SphereGeometry(0.17, 18, 18),
+        new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 0.45 })
+      );
+      mesh.userData.type = type;
+      return mesh;
+    };
+    const azHandle = mkHandle(0x20ffc0, "azimuth");
+    const elHandle = mkHandle(0xff79cc, "elevation");
+    const distHandle = mkHandle(0xffc857, "distance");
+    scene.add(azHandle, elHandle, distHandle);
+
+    const targetPlaneMaterial = new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide });
+    const targetPlane = new THREE.Mesh(new THREE.PlaneGeometry(1.35, 1.35), targetPlaneMaterial);
+    targetPlane.position.copy(center);
+    scene.add(targetPlane);
+
+    const cameraModel = new THREE.Group();
+    const bodyMat = new THREE.MeshStandardMaterial({ color: 0x5f90ff, metalness: 0.45, roughness: 0.35 });
+    const body = new THREE.Mesh(new THREE.BoxGeometry(0.32, 0.2, 0.38), bodyMat);
+    const lens = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.1, 0.2, 16), bodyMat);
+    lens.rotation.x = Math.PI / 2;
+    lens.position.z = 0.27;
+    cameraModel.add(body, lens);
+    scene.add(cameraModel);
+
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+    let dragType = null;
+
+    const syncObjects = (state) => {
+      const yawDeg = state.yaw360;
+      const pitchDeg = state.pitch;
+      const dist = state.distanceFactor;
+      const yaw = THREE.MathUtils.degToRad(yawDeg);
+      const pitch = THREE.MathUtils.degToRad(pitchDeg);
+
+      azHandle.position.set(Math.sin(yaw) * AZ, 0.06, Math.cos(yaw) * AZ);
+      elHandle.position.set(-0.8, EL * Math.sin(pitch) + center.y, EL * Math.cos(pitch));
+      distHandle.position.set(-2.15 + (dist - 1.0) * 2.2, center.y, 0);
+
+      const r = 1.8 * dist;
+      cameraModel.position.set(Math.sin(yaw) * r, center.y + Math.sin(pitch) * 1.05, Math.cos(yaw) * r);
+      cameraModel.lookAt(center);
+    };
+
+    const state = {
+      yaw360: toYaw360(values.camera_yaw),
+      pitch: Math.max(-30, Math.min(60, Number(values.camera_pitch || 0))),
+      distanceFactor: toDistanceFactor(values.camera_distance),
+    };
+    syncObjects(state);
+
+    const onPointer = (event) => {
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+    };
+    const onDown = (event) => {
+      onPointer(event);
+      raycaster.setFromCamera(mouse, camera);
+      const hit = raycaster.intersectObjects([azHandle, elHandle, distHandle])[0];
+      dragType = hit?.object?.userData?.type || null;
+      renderer.domElement.style.cursor = dragType ? "grabbing" : "default";
+    };
+    const onMove = (event) => {
+      if (!dragType) return;
+      onPointer(event);
+      raycaster.setFromCamera(mouse, camera);
+      if (dragType === "azimuth") {
+        const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -0.06);
+        const hit = new THREE.Vector3();
+        if (raycaster.ray.intersectPlane(plane, hit)) {
+          let next = THREE.MathUtils.radToDeg(Math.atan2(hit.x, hit.z));
+          if (next < 0) next += 360;
+          state.yaw360 = Math.round(next);
+        }
+      } else if (dragType === "elevation") {
+        const plane = new THREE.Plane(new THREE.Vector3(1, 0, 0), 0.8);
+        const hit = new THREE.Vector3();
+        if (raycaster.ray.intersectPlane(plane, hit)) {
+          const relY = hit.y - center.y;
+          const relZ = hit.z;
+          state.pitch = Math.max(-30, Math.min(60, Math.round(THREE.MathUtils.radToDeg(Math.atan2(relY, relZ)))));
+        }
+      } else if (dragType === "distance") {
+        state.distanceFactor = Math.max(0.6, Math.min(1.4, state.distanceFactor + event.movementX * 0.004));
+      }
+      syncObjects(state);
+      updateParent(state);
+    };
+    const onUp = () => {
+      dragType = null;
+      renderer.domElement.style.cursor = "grab";
+    };
+
+    renderer.domElement.addEventListener("pointerdown", onDown);
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    renderer.domElement.style.cursor = "grab";
+
+    const handleResize = () => {
+      if (!mountRef.current) return;
+      camera.aspect = mountRef.current.clientWidth / mountRef.current.clientHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(mountRef.current.clientWidth, mountRef.current.clientHeight);
+    };
+    window.addEventListener("resize", handleResize);
+
+    let raf = 0;
+    const render = () => {
+      renderer.render(scene, camera);
+      raf = requestAnimationFrame(render);
+    };
+    render();
+
+    runtimeRef.current = { state, syncObjects, targetPlaneMaterial };
+
+    return () => {
+      cancelAnimationFrame(raf);
+      window.removeEventListener("resize", handleResize);
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      renderer.domElement.removeEventListener("pointerdown", onDown);
+      renderer.dispose();
+      mount.innerHTML = "";
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    const rt = runtimeRef.current;
+    if (!rt) return;
+    const state = rt.state;
+    state.yaw360 = toYaw360(values.camera_yaw);
+    state.pitch = Math.max(-30, Math.min(60, Number(values.camera_pitch || 0)));
+    state.distanceFactor = toDistanceFactor(values.camera_distance);
+    rt.syncObjects(state);
+  }, [values.camera_yaw, values.camera_pitch, values.camera_distance]);
+
+  useEffect(() => {
+    const rt = runtimeRef.current;
+    if (!rt?.targetPlaneMaterial) return;
+    if (!previewSrc) {
+      rt.targetPlaneMaterial.map = null;
+      rt.targetPlaneMaterial.needsUpdate = true;
+      return;
+    }
+    new THREE.TextureLoader().load(previewSrc, (texture) => {
+      texture.minFilter = THREE.LinearFilter;
+      texture.magFilter = THREE.LinearFilter;
+      rt.targetPlaneMaterial.map = texture;
+      rt.targetPlaneMaterial.needsUpdate = true;
+    });
+  }, [previewSrc]);
 
   return (
     <div className="camera-pad-wrap">
-      <div
-        ref={padRef}
-        className="camera-pad"
-        onPointerDown={(event) => { setDragging(true); move(event); }}
-        onPointerMove={(event) => { if (dragging) move(event); }}
-        onPointerUp={() => setDragging(false)}
-        onPointerLeave={() => setDragging(false)}
-      >
-        <div className="camera-cross-x" />
-        <div className="camera-cross-y" />
-        <div className="camera-dot" style={{ left: `${((values.camera_yaw + 180) / 360) * 100}%`, top: `${((45 - values.camera_pitch) / 90) * 100}%` }} />
-      </div>
+      <div className="camera-viewport" ref={mountRef} />
       <div className="toolbar" style={{ marginTop: 8 }}>
-        {[{ label: "主视角", yaw: 0, pitch: 0 }, { label: "左前45", yaw: -45, pitch: 0 }, { label: "右前45", yaw: 45, pitch: 0 }, { label: "俯视角", yaw: 0, pitch: -20 }].map((item) => (
-          <button key={item.label} type="button" className="btn-secondary" onClick={() => setValues((prev) => ({ ...prev, camera_yaw: item.yaw, camera_pitch: item.pitch }))}>{item.label}</button>
+        {[{ label: "正面", yaw: 0, pitch: 0 }, { label: "右侧45°", yaw: 45, pitch: 0 }, { label: "背面", yaw: 180, pitch: 0 }, { label: "低角度", yaw: toYaw360(values.camera_yaw), pitch: -30 }, { label: "高角度", yaw: toYaw360(values.camera_yaw), pitch: 60 }].map((item) => (
+          <button key={item.label} type="button" className="btn-secondary" onClick={() => updateParent({ yaw360: item.yaw, pitch: item.pitch })}>{item.label}</button>
         ))}
       </div>
       <div className="grid" style={{ marginTop: 8 }}>
-        <div className="field"><label>yaw</label><input type="number" min={-180} max={180} value={values.camera_yaw} onChange={(event) => setValues((prev) => ({ ...prev, camera_yaw: Number(event.target.value || 0) }))} /></div>
-        <div className="field"><label>pitch</label><input type="number" min={-45} max={45} value={values.camera_pitch} onChange={(event) => setValues((prev) => ({ ...prev, camera_pitch: Number(event.target.value || 0) }))} /></div>
-        <div className="field"><label>distance</label><select value={values.camera_distance} onChange={(event) => setValues((prev) => ({ ...prev, camera_distance: event.target.value }))}><option value="near">near</option><option value="medium">medium</option><option value="far">far</option></select></div>
-        <div className="field"><label>focal</label><select value={values.camera_focal_mm} onChange={(event) => setValues((prev) => ({ ...prev, camera_focal_mm: event.target.value }))}><option value="35">35mm</option><option value="50">50mm</option><option value="85">85mm</option></select></div>
+        <div className="field"><label>Azimuth (0~315)</label><input type="range" min={0} max={315} step={45} value={toYaw360(values.camera_yaw)} onChange={(event) => updateParent({ yaw360: Number(event.target.value || 0) })} /></div>
+        <div className="field"><label>Elevation (-30~60)</label><input type="range" min={-30} max={60} step={30} value={Math.max(-30, Math.min(60, Number(values.camera_pitch || 0)))} onChange={(event) => updateParent({ pitch: Number(event.target.value || 0) })} /></div>
+        <div className="field"><label>Distance</label><input type="range" min={0.6} max={1.4} step={0.1} value={toDistanceFactor(values.camera_distance)} onChange={(event) => updateParent({ distanceFactor: Number(event.target.value || 1) })} /></div>
+        <div className="field"><label>Focal</label><select value={values.camera_focal_mm} onChange={(event) => setValues((prev) => ({ ...prev, camera_focal_mm: event.target.value }))}><option value="35">35mm</option><option value="50">50mm</option><option value="85">85mm</option></select></div>
       </div>
-      <div className="status-banner" style={{ marginTop: 8 }}>yaw {values.camera_yaw}° | pitch {values.camera_pitch}° | {values.camera_focal_mm}mm | {values.camera_distance}</div>
-      <div className="preview-stage" style={{ marginTop: 8 }}>
-        {previewSrc ? (
-          <img
-            src={previewSrc}
-            alt="camera-preview"
-            style={{ transform: `perspective(${perspective}px) rotateY(${(values.camera_yaw * 0.35).toFixed(2)}deg) rotateX(${(-values.camera_pitch * 0.5).toFixed(2)}deg) scale(${scale})` }}
-          />
-        ) : (
-          <span className="muted">上传主图后可预览机位变化</span>
-        )}
+      <div className="status-banner" style={{ marginTop: 8 }}>
+        Azimuth {toYaw360(values.camera_yaw)}° · Elevation {Math.max(-30, Math.min(60, Number(values.camera_pitch || 0)))}° · Distance {values.camera_distance} · {values.camera_focal_mm}mm
       </div>
     </div>
   );
@@ -1005,15 +1213,11 @@ function ToolTasksPage({ tool, navigate }) {
 
           {tool.slug === "multi-angle-camera" && (
             <>
-              <input type="hidden" name="camera_yaw" value={formValues.camera_yaw} readOnly />
-              <input type="hidden" name="camera_pitch" value={formValues.camera_pitch} readOnly />
-              <input type="hidden" name="camera_distance" value={formValues.camera_distance} readOnly />
+              <input type="hidden" name="camera_yaw" value={0} readOnly />
+              <input type="hidden" name="camera_pitch" value={0} readOnly />
+              <input type="hidden" name="camera_distance" value="medium" readOnly />
               <input type="hidden" name="camera_focal_mm" value={formValues.camera_focal_mm} readOnly />
               <input type="hidden" name="camera_aspect_ratio" value={formValues.camera_aspect_ratio} readOnly />
-              <div className="field" style={{ gridColumn: "1 / -1" }}>
-                <label>可视化机位控制</label>
-                <MultiAnglePad values={formValues} setValues={setFormValues} previewSrc={previewSrc} />
-              </div>
             </>
           )}
 
