@@ -15,7 +15,19 @@ def get_store() -> InMemoryStore:
     settings = get_settings()
     backend = (settings.store_backend or "auto").strip().lower()
     if backend == "auto":
-        backend = "redis" if settings.redis_url else "local"
+        if settings.redis_url:
+            backend = "redis"
+        elif all(
+            [
+                settings.oss_access_key,
+                settings.oss_secret_key,
+                settings.oss_bucket,
+                settings.oss_endpoint,
+            ]
+        ):
+            backend = "oss"
+        else:
+            backend = "local"
 
     if backend == "redis":
         if not settings.redis_url:
@@ -23,6 +35,27 @@ def get_store() -> InMemoryStore:
         return InMemoryStore(
             redis_url=settings.redis_url,
             redis_state_key=settings.redis_state_key,
+        )
+    if backend == "oss":
+        if not all(
+            [
+                settings.oss_access_key,
+                settings.oss_secret_key,
+                settings.oss_bucket,
+                settings.oss_endpoint,
+            ]
+        ):
+            raise RuntimeError(
+                "MVP_STORE_BACKEND=oss requires OSS credentials (MVP_OSS_* or OSS_*)."
+            )
+        root_prefix = str(settings.oss_root_prefix or "").strip().strip("/")
+        state_key = f"{root_prefix}/state/store.json" if root_prefix else "state/store.json"
+        return InMemoryStore(
+            oss_access_key=settings.oss_access_key,
+            oss_secret_key=settings.oss_secret_key,
+            oss_bucket=settings.oss_bucket,
+            oss_endpoint=settings.oss_endpoint,
+            oss_state_key=state_key,
         )
 
     return InMemoryStore(persist_path=settings.storage_root / "state" / "store.json")

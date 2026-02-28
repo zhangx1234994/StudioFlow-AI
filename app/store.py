@@ -26,6 +26,11 @@ try:  # pragma: no cover - optional runtime dependency
 except Exception:  # pragma: no cover - optional runtime dependency
     redis = None
 
+try:  # pragma: no cover - optional runtime dependency
+    import oss2
+except Exception:  # pragma: no cover - optional runtime dependency
+    oss2 = None
+
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -39,6 +44,11 @@ class InMemoryStore:
         persist_path: Path | None = None,
         redis_url: str | None = None,
         redis_state_key: str = "photo2video:state",
+        oss_access_key: str | None = None,
+        oss_secret_key: str | None = None,
+        oss_bucket: str | None = None,
+        oss_endpoint: str | None = None,
+        oss_state_key: str = "photo2video/state/store.json",
     ) -> None:
         self._projects: dict[str, ProjectRecord] = {}
         self._renders: dict[str, RenderRecord] = {}
@@ -51,6 +61,8 @@ class InMemoryStore:
         self._redis_url = redis_url
         self._redis_state_key = redis_state_key
         self._redis_client = None
+        self._oss_bucket = None
+        self._oss_state_key = oss_state_key
 
         if self._redis_url:
             if redis is None:
@@ -62,6 +74,15 @@ class InMemoryStore:
                 self._redis_url,
                 decode_responses=True,
             )
+            self._load_from_persistence()
+        elif all([oss_access_key, oss_secret_key, oss_bucket, oss_endpoint]):
+            if oss2 is None:
+                raise RuntimeError(
+                    "OSS backend requested but `oss2` package is not installed. "
+                    "Install with: pip install oss2"
+                )
+            auth = oss2.Auth(oss_access_key, oss_secret_key)
+            self._oss_bucket = oss2.Bucket(auth, f"https://{oss_endpoint}", oss_bucket)
             self._load_from_persistence()
         elif self._persist_path:
             self._persist_path.parent.mkdir(parents=True, exist_ok=True)
@@ -257,6 +278,16 @@ class InMemoryStore:
                 return
             if not raw_payload:
                 return
+        elif self._oss_bucket is not None:
+            try:
+                response = self._oss_bucket.get_object(self._oss_state_key)
+                raw_payload = response.read().decode("utf-8")
+            except Exception as exc:  # pragma: no cover - network instability
+                message = str(exc).lower()
+                if "no such key" in message or "not found" in message or "404" in message:
+                    return
+                logger.warning("Failed to load persisted store from OSS key %s: %s", self._oss_state_key, exc)
+                return
         elif self._persist_path and self._persist_path.exists():
             raw_payload = self._persist_path.read_text(encoding="utf-8")
         else:
@@ -303,6 +334,8 @@ class InMemoryStore:
                 self._project_logs.setdefault(project_id, [])
             if self._redis_client is not None:
                 logger.info("Loaded persisted store from redis key %s", self._redis_state_key)
+            elif self._oss_bucket is not None:
+                logger.info("Loaded persisted store from OSS key %s", self._oss_state_key)
             else:
                 logger.info("Loaded persisted store from %s", self._persist_path)
         except Exception as exc:  # pragma: no cover - defensive path
@@ -310,6 +343,12 @@ class InMemoryStore:
                 logger.warning(
                     "Failed to load persisted store from redis key %s: %s",
                     self._redis_state_key,
+                    exc,
+                )
+            elif self._oss_bucket is not None:
+                logger.warning(
+                    "Failed to load persisted store from OSS key %s: %s",
+                    self._oss_state_key,
                     exc,
                 )
             else:
@@ -322,7 +361,7 @@ class InMemoryStore:
             self._project_logs = {}
 
     def _persist_locked(self) -> None:
-        if not self._persist_path and self._redis_client is None:
+        if not self._persist_path and self._redis_client is None and self._oss_bucket is None:
             return
         payload = {
             "schema_version": self.STORE_SCHEMA_VERSION,
@@ -348,6 +387,20 @@ class InMemoryStore:
                 logger.warning(
                     "Failed to persist store to redis key %s: %s",
                     self._redis_state_key,
+                    exc,
+                )
+            return
+        if self._oss_bucket is not None:
+            try:
+                self._oss_bucket.put_object(
+                    self._oss_state_key,
+                    payload_json.encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                )
+            except Exception as exc:  # pragma: no cover - network instability
+                logger.warning(
+                    "Failed to persist store to OSS key %s: %s",
+                    self._oss_state_key,
                     exc,
                 )
             return
