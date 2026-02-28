@@ -697,6 +697,28 @@ function MultiAnglePad({ values, setValues, previewSrc }) {
     if (factor >= 1.2) return "far";
     return "medium";
   };
+  const azimuthLabel = (yaw) => {
+    const m = {
+      0: "front-view",
+      45: "front-right-view",
+      90: "right-view",
+      135: "back-right-view",
+      180: "back-view",
+      225: "back-left-view",
+      270: "left-view",
+      315: "front-left-view",
+    };
+    return m[yaw] || "front-view";
+  };
+  const elevationLabel = (pitch) => {
+    const m = {
+      "-30": "low-angle-shot",
+      "0": "eye-level-shot",
+      "30": "elevated-shot",
+      "60": "high-angle-shot",
+    };
+    return m[String(pitch)] || "eye-level-shot";
+  };
   const updateParent = useCallback((next) => {
     setValues((prev) => {
       const yaw360 = toYaw360(next.yaw360 ?? toYaw360(prev.camera_yaw));
@@ -923,13 +945,17 @@ function MultiAnglePad({ values, setValues, previewSrc }) {
 
   return (
     <div className="camera-pad-wrap">
+      <div className="camera-panel-title">3D 机位控制</div>
       <div className="camera-viewport" ref={mountRef} />
+      <div className="camera-token">
+        {`<sks> ${azimuthLabel(toYaw360(values.camera_yaw))} ${elevationLabel(Math.max(-30, Math.min(60, Number(values.camera_pitch || 0))))} ${values.camera_distance}`}
+      </div>
       <div className="toolbar" style={{ marginTop: 8 }}>
         {[{ label: "正面", yaw: 0, pitch: 0 }, { label: "右侧45°", yaw: 45, pitch: 0 }, { label: "背面", yaw: 180, pitch: 0 }, { label: "低角度", yaw: toYaw360(values.camera_yaw), pitch: -30 }, { label: "高角度", yaw: toYaw360(values.camera_yaw), pitch: 60 }].map((item) => (
           <button key={item.label} type="button" className="btn-secondary" onClick={() => updateParent({ yaw360: item.yaw, pitch: item.pitch })}>{item.label}</button>
         ))}
       </div>
-      <div className="grid" style={{ marginTop: 8 }}>
+      <div className="grid camera-slider-grid" style={{ marginTop: 8 }}>
         <div className="field"><label>Azimuth (0~315)</label><input type="range" min={0} max={315} step={45} value={toYaw360(values.camera_yaw)} onChange={(event) => updateParent({ yaw360: Number(event.target.value || 0) })} /></div>
         <div className="field"><label>Elevation (-30~60)</label><input type="range" min={-30} max={60} step={30} value={Math.max(-30, Math.min(60, Number(values.camera_pitch || 0)))} onChange={(event) => updateParent({ pitch: Number(event.target.value || 0) })} /></div>
         <div className="field"><label>Distance</label><input type="range" min={0.6} max={1.4} step={0.1} value={toDistanceFactor(values.camera_distance)} onChange={(event) => updateParent({ distanceFactor: Number(event.target.value || 1) })} /></div>

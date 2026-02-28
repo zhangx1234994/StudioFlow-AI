@@ -534,10 +534,15 @@ button:disabled {
 }
 
 .camera-pad-wrap {
-  border: 1px dashed var(--border-strong);
+  border: 1px solid var(--border-strong);
   border-radius: var(--radius-md);
   background: var(--panel-soft);
   padding: 10px;
+}
+
+.camera-panel-title {
+  font-weight: 700;
+  margin-bottom: 8px;
 }
 
 .camera-viewport {
@@ -547,6 +552,26 @@ button:disabled {
   border-radius: 12px;
   overflow: hidden;
   background: #12151f;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.04);
+}
+
+.camera-token {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: #0f1629;
+  color: #2cfab7;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  border: 1px solid #1d335f;
+  overflow-wrap: anywhere;
+}
+
+.camera-slider-grid {
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #fff;
 }
 
 .camera-pad {
