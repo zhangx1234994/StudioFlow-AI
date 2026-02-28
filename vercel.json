@@ -1,12 +1,12 @@
 {
   "version": 2,
-  "builds": [
-    {
-      "src": "api/index.py",
-      "use": "@vercel/python"
-    }
-  ],
   "buildCommand": "npm --prefix frontend ci && npm --prefix frontend run build",
+  "functions": {
+    "api/index.py": {
+      "runtime": "python3.12",
+      "includeFiles": "frontend/out/**"
+    }
+  },
   "routes": [
     {
       "src": "/(.*)",
