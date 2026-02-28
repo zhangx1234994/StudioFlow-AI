@@ -1,11 +1,11 @@
 {
   "version": 2,
-  "buildCommand": "npm --prefix frontend ci && npm --prefix frontend run build",
-  "functions": {
-    "api/index.py": {
-      "includeFiles": "frontend/out/**"
+  "builds": [
+    {
+      "src": "api/index.py",
+      "use": "@vercel/python"
     }
-  },
+  ],
   "routes": [
     {
       "src": "/(.*)",
