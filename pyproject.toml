@@ -24,6 +24,13 @@ test = [
 requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+exclude = ["api*", "frontend*", "tests*", "docs*", "data*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
