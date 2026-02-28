@@ -924,26 +924,26 @@ function ToolTasksPage({ tool, navigate }) {
                   {selectedFiles.image.length > 0 && <button type="button" className="btn-ghost" onClick={() => clearFiles("image")}>撤回已选</button>}
                 </div>
               </div>
-              {(tool.slug === "product-image" || tool.slug === "multi-angle-camera") && (
+              {tool.slug === "product-image" && (
                 <div className="field">
                   <label>风格参考图（可多选）</label>
                   <input
-                    key={`${tool.slug}-reference-${tool.slug === "product-image" ? fileInputVersion.reference_images : fileInputVersion.style_reference_images}`}
-                    name={tool.slug === "product-image" ? "reference_images" : "style_reference_images"}
+                    key={`${tool.slug}-reference-${fileInputVersion.reference_images}`}
+                    name="reference_images"
                     type="file"
                     accept="image/*"
                     multiple
-                    onChange={(event) => onFileChange(tool.slug === "product-image" ? "reference_images" : "style_reference_images", event)}
+                    onChange={(event) => onFileChange("reference_images", event)}
                   />
                   <div className="toolbar">
                     <span className="muted">
-                      {selectedFileSummary(tool.slug === "product-image" ? selectedFiles.reference_images : selectedFiles.style_reference_images)}
+                      {selectedFileSummary(selectedFiles.reference_images)}
                     </span>
-                    {(tool.slug === "product-image" ? selectedFiles.reference_images.length : selectedFiles.style_reference_images.length) > 0 && (
+                    {selectedFiles.reference_images.length > 0 && (
                       <button
                         type="button"
                         className="btn-ghost"
-                        onClick={() => clearFiles(tool.slug === "product-image" ? "reference_images" : "style_reference_images")}
+                        onClick={() => clearFiles("reference_images")}
                       >
                         撤回已选
                       </button>
@@ -954,7 +954,11 @@ function ToolTasksPage({ tool, navigate }) {
             </>
           )}
           <div className="field"><label>模板</label><select name="template_name" value={formValues.template_name} onChange={(event) => setFormValues((prev) => ({ ...prev, template_name: event.target.value }))}>{templates.map((item) => <option key={item.template_name} value={item.template_name}>{item.display_name}</option>)}</select></div>
-          <div className="field"><label>平台</label><input name="platform" value={formValues.platform} onChange={(event) => setFormValues((prev) => ({ ...prev, platform: event.target.value }))} /></div>
+          {tool.slug !== "multi-angle-camera" ? (
+            <div className="field"><label>平台</label><input name="platform" value={formValues.platform} onChange={(event) => setFormValues((prev) => ({ ...prev, platform: event.target.value }))} /></div>
+          ) : (
+            <input name="platform" type="hidden" value={formValues.platform} readOnly />
+          )}
 
           {tool.slug === "intro-video" && (
             <div className="field"><label>时长（秒）</label><input name="desired_duration_sec" type="number" min={15} max={50} value={formValues.desired_duration_sec} onChange={(event) => setFormValues((prev) => ({ ...prev, desired_duration_sec: Number(event.target.value || 15) }))} /></div>
@@ -979,12 +983,25 @@ function ToolTasksPage({ tool, navigate }) {
             </>
           )}
 
-          <div className="field"><label>关键卖点（逗号）</label><input name="key_features" value={formValues.key_features} onChange={(event) => setFormValues((prev) => ({ ...prev, key_features: event.target.value }))} /></div>
-          <div className="field"><label>受众</label><input name="target_audience" value={formValues.target_audience} onChange={(event) => setFormValues((prev) => ({ ...prev, target_audience: event.target.value }))} /></div>
-          <div className="field"><label>语气</label><input name="tone" value={formValues.tone} onChange={(event) => setFormValues((prev) => ({ ...prev, tone: event.target.value }))} /></div>
-          <div className="field"><label>证据点（逗号）</label><input name="evidence_points" value={formValues.evidence_points} onChange={(event) => setFormValues((prev) => ({ ...prev, evidence_points: event.target.value }))} /></div>
-          <div className="field"><label>渠道（逗号）</label><input name="channels" value={formValues.channels} onChange={(event) => setFormValues((prev) => ({ ...prev, channels: event.target.value }))} /></div>
-          <div className="field"><label>合规屏蔽词（逗号）</label><input name="compliance_blocklist" value={formValues.compliance_blocklist} onChange={(event) => setFormValues((prev) => ({ ...prev, compliance_blocklist: event.target.value }))} /></div>
+          {tool.slug !== "multi-angle-camera" ? (
+            <>
+              <div className="field"><label>关键卖点（逗号）</label><input name="key_features" value={formValues.key_features} onChange={(event) => setFormValues((prev) => ({ ...prev, key_features: event.target.value }))} /></div>
+              <div className="field"><label>受众</label><input name="target_audience" value={formValues.target_audience} onChange={(event) => setFormValues((prev) => ({ ...prev, target_audience: event.target.value }))} /></div>
+              <div className="field"><label>语气</label><input name="tone" value={formValues.tone} onChange={(event) => setFormValues((prev) => ({ ...prev, tone: event.target.value }))} /></div>
+              <div className="field"><label>证据点（逗号）</label><input name="evidence_points" value={formValues.evidence_points} onChange={(event) => setFormValues((prev) => ({ ...prev, evidence_points: event.target.value }))} /></div>
+              <div className="field"><label>渠道（逗号）</label><input name="channels" value={formValues.channels} onChange={(event) => setFormValues((prev) => ({ ...prev, channels: event.target.value }))} /></div>
+              <div className="field"><label>合规屏蔽词（逗号）</label><input name="compliance_blocklist" value={formValues.compliance_blocklist} onChange={(event) => setFormValues((prev) => ({ ...prev, compliance_blocklist: event.target.value }))} /></div>
+            </>
+          ) : (
+            <>
+              <input name="key_features" type="hidden" value={formValues.key_features} readOnly />
+              <input name="target_audience" type="hidden" value={formValues.target_audience} readOnly />
+              <input name="tone" type="hidden" value={formValues.tone} readOnly />
+              <input name="evidence_points" type="hidden" value={formValues.evidence_points} readOnly />
+              <input name="channels" type="hidden" value={formValues.channels} readOnly />
+              <input name="compliance_blocklist" type="hidden" value={formValues.compliance_blocklist} readOnly />
+            </>
+          )}
 
           {tool.slug === "multi-angle-camera" && (
             <>
@@ -1000,10 +1017,14 @@ function ToolTasksPage({ tool, navigate }) {
             </>
           )}
 
-          <div className="field" style={{ gridColumn: "1 / -1" }}><label>创意指令</label><textarea name="creative_direction" value={formValues.creative_direction} onChange={(event) => setFormValues((prev) => ({ ...prev, creative_direction: event.target.value }))} /></div>
+          {tool.slug !== "multi-angle-camera" ? (
+            <div className="field" style={{ gridColumn: "1 / -1" }}><label>创意指令</label><textarea name="creative_direction" value={formValues.creative_direction} onChange={(event) => setFormValues((prev) => ({ ...prev, creative_direction: event.target.value }))} /></div>
+          ) : (
+            <input name="creative_direction" type="hidden" value={formValues.creative_direction} readOnly />
+          )}
 
           <div style={{ gridColumn: "1 / -1" }} className="toolbar">
-            <button type="submit" className="btn-primary" disabled={creating}>{creating ? "提交中..." : tool.slug === "model-retouch" ? "批量创建任务" : "创建并进入工作台"}</button>
+            <button type="submit" className="btn-primary" disabled={creating}>{creating ? "提交中..." : tool.slug === "model-retouch" ? "批量创建任务" : tool.slug === "multi-angle-camera" ? "创建并进入机位台" : "创建并进入工作台"}</button>
           </div>
         </form>
         <div className={cx("status-banner", createStatus.type)}>{createStatus.text}</div>
@@ -1501,20 +1522,20 @@ function ProjectWorkspace({ tool, projectId, navigate }) {
                   <div className="toolbar" style={{ marginTop: 10 }}>
                     <button
                       type="button"
-                      className="btn-primary"
+                      className="btn-secondary"
                       onClick={async () => {
                         try {
                           setPlanStatus({ text: "保存机位参数并生成方案...", type: "" });
                           await applyCameraInputs();
                           await requestPlan(true);
                           await load();
-                          setPlanStatus({ text: "机位方案已更新，可执行批量生成。", type: "success" });
+                          setPlanStatus({ text: "机位方案已更新。", type: "success" });
                         } catch (error) {
                           setPlanStatus({ text: error.message, type: "error" });
                         }
                       }}
                     >
-                      保存机位并更新方案
+                      仅保存机位
                     </button>
                   </div>
                 </>
@@ -1535,20 +1556,52 @@ function ProjectWorkspace({ tool, projectId, navigate }) {
               )}
               <div className={cx("status-banner", planStatus.type)}>{planStatus.text}</div>
               <div style={{ marginTop: 12 }}>
-                <h3>当前方案</h3>
-                {project?.project_plan?.shots?.length ? (
-                  <div className="asset-grid">
-                    {project.project_plan.shots.map((shot) => (
-                      <div className="asset-card" key={shot.shot_id}>
-                        <strong>{shot.title || shot.shot_id}</strong>
-                        <div className="muted">{shot.intent || ""}</div>
-                        <div className="muted">生图：{shot.image_prompt || "-"}</div>
-                        {tool.category === "video" && <div className="muted">视频：{shot.video_prompt || "-"}</div>}
-                      </div>
-                    ))}
-                  </div>
+                {tool.slug === "multi-angle-camera" ? (
+                  <>
+                    <h3>机位参数摘要</h3>
+                    <div className="status-banner">
+                      yaw {Number(cameraInputs.yaw || 0)}° · pitch {Number(cameraInputs.pitch || 0)}° · {cameraInputs.focal_mm || "50"}mm · {cameraInputs.distance || "medium"} · {cameraInputs.aspect_ratio || "1:1"}
+                    </div>
+                    <div className="toolbar" style={{ marginTop: 10 }}>
+                      <button
+                        type="button"
+                        className="btn-primary"
+                        onClick={async () => {
+                          try {
+                            setPlanStatus({ text: "保存机位并提交多角度生成...", type: "" });
+                            await applyCameraInputs();
+                            await requestPlan(false);
+                            await submitGenerate("auto");
+                            await load();
+                            setStep(generationStepIndex);
+                            setPlanStatus({ text: "多角度生成任务已提交，正在逐张返回。", type: "success" });
+                          } catch (error) {
+                            setPlanStatus({ text: error.message, type: "error" });
+                          }
+                        }}
+                      >
+                        开始生成多角度图
+                      </button>
+                    </div>
+                  </>
                 ) : (
-                  <div className="empty-state">暂无方案，请先生成。</div>
+                  <>
+                    <h3>当前方案</h3>
+                    {project?.project_plan?.shots?.length ? (
+                      <div className="asset-grid">
+                        {project.project_plan.shots.map((shot) => (
+                          <div className="asset-card" key={shot.shot_id}>
+                            <strong>{shot.title || shot.shot_id}</strong>
+                            <div className="muted">{shot.intent || ""}</div>
+                            <div className="muted">生图：{shot.image_prompt || "-"}</div>
+                            {tool.category === "video" && <div className="muted">视频：{shot.video_prompt || "-"}</div>}
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="empty-state">暂无方案，请先生成。</div>
+                    )}
+                  </>
                 )}
               </div>
             </section>
@@ -1596,14 +1649,18 @@ function ProjectWorkspace({ tool, projectId, navigate }) {
               <div className="toolbar">
                 {tool.category === "image" ? (
                   <>
-                    <label className="muted">每镜头生图数</label>
+                    <label className="muted">{tool.slug === "multi-angle-camera" ? "每个角度出图数" : "每镜头生图数"}</label>
                     <input style={{ width: 90 }} type="number" min={1} max={4} value={options.candidates_per_prompt} onChange={(event) => setOptions((prev) => ({ ...prev, candidates_per_prompt: Number(event.target.value || 1) }))} />
                     <label className="muted">比例</label>
                     <select style={{ width: 110 }} value={options.image_aspect_ratio} onChange={(event) => setOptions((prev) => ({ ...prev, image_aspect_ratio: event.target.value }))}><option value="1:1">1:1</option><option value="4:5">4:5</option><option value="3:4">3:4</option><option value="9:16">9:16</option><option value="16:9">16:9</option></select>
-                    <label className="muted">分辨率</label>
-                    <select style={{ width: 90 }} value={options.image_resolution} onChange={(event) => setOptions((prev) => ({ ...prev, image_resolution: event.target.value }))}><option value="1K">1K</option><option value="2K">2K</option><option value="4K">4K</option></select>
-                    <label className="muted">格式</label>
-                    <select style={{ width: 90 }} value={options.image_output_format} onChange={(event) => setOptions((prev) => ({ ...prev, image_output_format: event.target.value }))}><option value="png">png</option><option value="jpg">jpg</option></select>
+                    {tool.slug !== "multi-angle-camera" && (
+                      <>
+                        <label className="muted">分辨率</label>
+                        <select style={{ width: 90 }} value={options.image_resolution} onChange={(event) => setOptions((prev) => ({ ...prev, image_resolution: event.target.value }))}><option value="1K">1K</option><option value="2K">2K</option><option value="4K">4K</option></select>
+                        <label className="muted">格式</label>
+                        <select style={{ width: 90 }} value={options.image_output_format} onChange={(event) => setOptions((prev) => ({ ...prev, image_output_format: event.target.value }))}><option value="png">png</option><option value="jpg">jpg</option></select>
+                      </>
+                    )}
                   </>
                 ) : (
                   <>
