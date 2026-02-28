@@ -96,6 +96,11 @@ class InMemoryStore:
 
     def get_project(self, project_id: str) -> ProjectRecord | None:
         with self._lock:
+            project = self._projects.get(project_id)
+        if project is not None or not self._has_remote_persistence:
+            return project
+        self._sync_from_remote()
+        with self._lock:
             return self._projects.get(project_id)
 
     def update_project(
@@ -103,6 +108,11 @@ class InMemoryStore:
         project_id: str,
         updater: Callable[[ProjectRecord], None],
     ) -> ProjectRecord:
+        if self._has_remote_persistence:
+            with self._lock:
+                missing = project_id not in self._projects
+            if missing:
+                self._sync_from_remote()
         with self._lock:
             project = self._projects[project_id]
             updater(project)
@@ -116,6 +126,11 @@ class InMemoryStore:
             self._persist_locked()
 
     def get_render(self, render_id: str) -> RenderRecord | None:
+        with self._lock:
+            render = self._renders.get(render_id)
+        if render is not None or not self._has_remote_persistence:
+            return render
+        self._sync_from_remote()
         with self._lock:
             return self._renders.get(render_id)
 
@@ -137,6 +152,11 @@ class InMemoryStore:
             self._persist_locked()
 
     def get_asset(self, asset_id: str) -> AssetRecord | None:
+        with self._lock:
+            asset = self._assets.get(asset_id)
+        if asset is not None or not self._has_remote_persistence:
+            return asset
+        self._sync_from_remote()
         with self._lock:
             return self._assets.get(asset_id)
 
@@ -249,6 +269,8 @@ class InMemoryStore:
             return logs[-limit:]
 
     def list_projects(self, limit: int = 20, query: str | None = None) -> list[ProjectRecord]:
+        if self._has_remote_persistence:
+            self._sync_from_remote()
         with self._lock:
             projects = list(self._projects.values())
             if query:
@@ -267,6 +289,15 @@ class InMemoryStore:
             if limit <= 0:
                 return []
             return projects[:limit]
+
+    @property
+    def _has_remote_persistence(self) -> bool:
+        return self._redis_client is not None or self._oss_bucket is not None
+
+    def _sync_from_remote(self) -> None:
+        if not self._has_remote_persistence:
+            return
+        self._load_from_persistence()
 
     def _load_from_persistence(self) -> None:
         raw_payload: str | None = None
@@ -307,19 +338,13 @@ class InMemoryStore:
             decision_rows = raw.get("review_decisions", [])
             log_rows = raw.get("project_logs", {})
 
-            self._projects = {
-                row["project_id"]: ProjectRecord.model_validate(row) for row in project_rows
-            }
-            self._renders = {
-                row["render_id"]: RenderRecord.model_validate(row) for row in render_rows
-            }
-            self._assets = {
-                row["asset_id"]: AssetRecord.model_validate(row) for row in asset_rows
-            }
-            self._quality_reports = {
+            projects = {row["project_id"]: ProjectRecord.model_validate(row) for row in project_rows}
+            renders = {row["render_id"]: RenderRecord.model_validate(row) for row in render_rows}
+            assets = {row["asset_id"]: AssetRecord.model_validate(row) for row in asset_rows}
+            quality_reports = {
                 row["quality_id"]: QualityReport.model_validate(row) for row in quality_rows
             }
-            self._review_decisions = {
+            review_decisions = {
                 row["decision_id"]: ReviewDecision.model_validate(row) for row in decision_rows
             }
             loaded_logs: dict[str, list[ProjectLog]] = {}
@@ -329,9 +354,15 @@ class InMemoryStore:
                         loaded_logs[project_id] = [
                             ProjectLog.model_validate(item) for item in rows
                         ]
-            self._project_logs = loaded_logs
-            for project_id in self._projects:
-                self._project_logs.setdefault(project_id, [])
+            for project_id in projects:
+                loaded_logs.setdefault(project_id, [])
+            with self._lock:
+                self._projects = projects
+                self._renders = renders
+                self._assets = assets
+                self._quality_reports = quality_reports
+                self._review_decisions = review_decisions
+                self._project_logs = loaded_logs
             if self._redis_client is not None:
                 logger.info("Loaded persisted store from redis key %s", self._redis_state_key)
             elif self._oss_bucket is not None:
@@ -353,12 +384,13 @@ class InMemoryStore:
                 )
             else:
                 logger.warning("Failed to load persisted store %s: %s", self._persist_path, exc)
-            self._projects = {}
-            self._renders = {}
-            self._assets = {}
-            self._quality_reports = {}
-            self._review_decisions = {}
-            self._project_logs = {}
+            with self._lock:
+                self._projects = {}
+                self._renders = {}
+                self._assets = {}
+                self._quality_reports = {}
+                self._review_decisions = {}
+                self._project_logs = {}
 
     def _persist_locked(self) -> None:
         if not self._persist_path and self._redis_client is None and self._oss_bucket is None:
