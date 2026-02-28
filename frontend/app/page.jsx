@@ -183,10 +183,78 @@ function parseCsv(value) {
     .filter(Boolean);
 }
 
+async function compressImageFile(file, options = {}) {
+  const {
+    maxBytes = 2 * 1024 * 1024,
+    maxDimension = 2048,
+    outputType = "image/jpeg",
+    startQuality = 0.9,
+    minQuality = 0.55,
+  } = options;
+  if (!(file instanceof File) || !file.type.startsWith("image/")) return file;
+  if (file.size <= maxBytes) return file;
+
+  const srcUrl = URL.createObjectURL(file);
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const element = new Image();
+      element.onload = () => resolve(element);
+      element.onerror = () => reject(new Error("图片读取失败"));
+      element.src = srcUrl;
+    });
+
+    const width = img.naturalWidth || img.width;
+    const height = img.naturalHeight || img.height;
+    if (!width || !height) return file;
+
+    const scale = Math.min(1, maxDimension / Math.max(width, height));
+    const targetWidth = Math.max(1, Math.round(width * scale));
+    const targetHeight = Math.max(1, Math.round(height * scale));
+    const canvas = document.createElement("canvas");
+    canvas.width = targetWidth;
+    canvas.height = targetHeight;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return file;
+    ctx.drawImage(img, 0, 0, targetWidth, targetHeight);
+
+    const fileBase = (file.name || "upload").replace(/\.[^.]+$/, "");
+    let quality = startQuality;
+    let blob = await new Promise((resolve) => canvas.toBlob(resolve, outputType, quality));
+    while (blob && blob.size > maxBytes && quality > minQuality) {
+      quality = Math.max(minQuality, quality - 0.08);
+      blob = await new Promise((resolve) => canvas.toBlob(resolve, outputType, quality));
+    }
+    if (!blob || blob.size >= file.size) return file;
+    return new File([blob], `${fileBase}.jpg`, { type: outputType });
+  } catch (_) {
+    return file;
+  } finally {
+    URL.revokeObjectURL(srcUrl);
+  }
+}
+
+async function buildSafeFormData(rawFormData) {
+  const safe = new FormData();
+  for (const [key, value] of rawFormData.entries()) {
+    if (!(value instanceof File)) {
+      safe.append(key, value);
+      continue;
+    }
+    const optimized = await compressImageFile(value);
+    safe.append(key, optimized);
+  }
+  return safe;
+}
+
 async function apiFetch(url, options = {}) {
   const resp = await fetch(url, { credentials: "include", ...options });
   const payload = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error(payload?.detail || payload?.msg || `请求失败 (${resp.status})`);
+  if (!resp.ok) {
+    if (resp.status === 413) {
+      throw new Error("上传图片过大（413）。请压缩图片后重试。");
+    }
+    throw new Error(payload?.detail || payload?.msg || `请求失败 (${resp.status})`);
+  }
   return payload;
 }
 
@@ -1056,10 +1124,11 @@ function ToolTasksPage({ tool, navigate }) {
 
   const create = async (event) => {
     event.preventDefault();
-    const fd = new FormData(formRef.current);
+    const raw = new FormData(formRef.current);
     setCreating(true);
-    setCreateStatus({ text: "提交中...", type: "" });
+    setCreateStatus({ text: "提交中（自动优化图片大小）...", type: "" });
     try {
+      const fd = await buildSafeFormData(raw);
       if (tool.slug === "model-retouch") {
         const result = await apiFetch("/api/v1/tools/model_retouch/batch-create", { method: "POST", body: fd });
         setHighlightBatch(result.batch_group_id || "");
