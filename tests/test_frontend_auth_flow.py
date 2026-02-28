@@ -37,3 +37,14 @@ def test_local_login_renders_tools_page() -> None:
 
     settings.auth_enabled = prev_enabled
     settings.auth_provider = prev_provider
+
+
+def test_next_assets_path_not_blocked_by_auth() -> None:
+    prev_enabled = settings.auth_enabled
+    settings.auth_enabled = True
+
+    client = TestClient(app)
+    resp = client.get("/_next/static/not-exists.js", follow_redirects=False)
+    assert resp.status_code == 404
+
+    settings.auth_enabled = prev_enabled

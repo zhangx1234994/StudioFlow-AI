@@ -251,7 +251,12 @@ def _auth_exempt_path(path: str) -> bool:
         "/app/login/",
     }:
         return True
-    if path.startswith("/static/") or path.startswith("/media/") or path.startswith("/app/_next/"):
+    if (
+        path.startswith("/static/")
+        or path.startswith("/media/")
+        or path.startswith("/app/_next/")
+        or path.startswith("/_next/")
+    ):
         return True
     if path.startswith("/api/v1/auth/"):
         return True
@@ -345,6 +350,18 @@ def _frontend_file_or_index(full_path: str) -> FileResponse:
     return FileResponse(index_file)
 
 
+def _frontend_static_asset(full_path: str) -> FileResponse:
+    if not frontend_out_dir.exists():
+        raise HTTPException(status_code=503, detail="Frontend assets are not built.")
+    candidate = (frontend_out_dir / full_path).resolve()
+    root = frontend_out_dir.resolve()
+    if not (candidate == root or candidate.is_relative_to(root)):
+        raise HTTPException(status_code=404, detail="Asset not found")
+    if not candidate.is_file():
+        raise HTTPException(status_code=404, detail="Asset not found")
+    return FileResponse(candidate)
+
+
 @app.get("/app", include_in_schema=False)
 def app_root() -> RedirectResponse:
     return RedirectResponse(url="/app/tools", status_code=status.HTTP_302_FOUND)
@@ -356,6 +373,11 @@ def app_spa(full_path: str) -> FileResponse:
     if not normalized:
         return _frontend_file_or_index("")
     return _frontend_file_or_index(normalized)
+
+
+@app.get("/_next/{full_path:path}", include_in_schema=False)
+def app_next_assets(full_path: str) -> FileResponse:
+    return _frontend_static_asset(f"_next/{full_path.strip('/')}")
 
 
 @app.post("/api/v1/auth/login")
