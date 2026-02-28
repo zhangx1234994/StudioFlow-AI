@@ -1695,44 +1695,6 @@ export default function AppPage() {
   useEffect(() => { refreshAuth(); }, [refreshAuth]);
 
   useEffect(() => {
-    const isViewportBlocker = (el) => {
-      if (!(el instanceof HTMLElement)) return false;
-      if (el.classList.contains("app-shell")) return false;
-      if (el.classList.contains("topbar")) return false;
-      const style = window.getComputedStyle(el);
-      if (style.display === "none" || style.visibility === "hidden") return false;
-      if (!["fixed", "absolute"].includes(style.position)) return false;
-      if (style.pointerEvents === "none") return false;
-      const rect = el.getBoundingClientRect();
-      const vw = window.innerWidth;
-      const vh = window.innerHeight;
-      const coversViewport = rect.width >= vw * 0.95 && rect.height >= vh * 0.95;
-      if (!coversViewport) return false;
-      return true;
-    };
-
-    const neutralizeBlockers = () => {
-      const nodes = Array.from(document.querySelectorAll("body *"));
-      for (const node of nodes) {
-        if (!isViewportBlocker(node)) continue;
-        node.setAttribute("data-overlay-neutralized", "true");
-        node.style.pointerEvents = "none";
-        node.style.background = "transparent";
-        node.style.backdropFilter = "none";
-      }
-    };
-
-    neutralizeBlockers();
-    const timer = window.setInterval(neutralizeBlockers, 1000);
-    const observer = new MutationObserver(() => neutralizeBlockers());
-    observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["style", "class", "open"] });
-    return () => {
-      window.clearInterval(timer);
-      observer.disconnect();
-    };
-  }, []);
-
-  useEffect(() => {
     if (auth.loading) return;
     if (!auth.authenticated && route.page !== "login") navigate("/app/login");
     if (auth.authenticated && route.page === "login") navigate("/app/tools");
