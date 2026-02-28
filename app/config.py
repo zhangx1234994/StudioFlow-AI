@@ -35,10 +35,16 @@ class Settings(BaseSettings):
     redis_state_key: str = "photo2video:state"
     allow_background_tasks: bool = True
     auth_enabled: bool = True
+    auth_provider: str = "local"
     admin_username: str = "admin"
+    admin_email: str = "admin@studioflow.local"
     admin_password: str = "admin123"
     auth_secret: str = "photo2video-dev-secret"
     auth_session_hours: int = 24
+    auth_session_days: int = 7
+    supabase_url: str | None = None
+    supabase_anon_key: str | None = None
+    supabase_service_role_key: str | None = None
     use_mock_providers: bool = True
     log_level: str = "INFO"
     log_to_file: bool = True
@@ -67,6 +73,15 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     settings = Settings()
+    settings.auth_provider = (settings.auth_provider or os.getenv("AUTH_PROVIDER") or "local").strip().lower()
+    settings.auth_session_days = int(
+        os.getenv("AUTH_SESSION_DAYS", str(settings.auth_session_days or 7))
+    )
+    settings.supabase_url = settings.supabase_url or os.getenv("SUPABASE_URL")
+    settings.supabase_anon_key = settings.supabase_anon_key or os.getenv("SUPABASE_ANON_KEY")
+    settings.supabase_service_role_key = (
+        settings.supabase_service_role_key or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    )
     settings.oss_access_key = settings.oss_access_key or os.getenv("OSS_ACCESS_KEY")
     settings.oss_secret_key = settings.oss_secret_key or os.getenv("OSS_SECRET_KEY")
     settings.oss_bucket = settings.oss_bucket or os.getenv("OSS_BUCKET")

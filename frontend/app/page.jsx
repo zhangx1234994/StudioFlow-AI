@@ -337,15 +337,29 @@ function LoginPage({ navigate, onLoginSuccess }) {
   const submit = async (event) => {
     event.preventDefault();
     const formData = new FormData(event.currentTarget);
+    const rawUsername = String(formData.get("username") || "").trim();
+    const normalized = !rawUsername.includes("@") && rawUsername.toLowerCase() === "admin"
+      ? "admin@studioflow.local"
+      : rawUsername;
+    formData.set("username", normalized);
     setLoading(true);
     setStatus({ text: "登录中...", type: "" });
     try {
       await apiFetch("/api/v1/auth/login", { method: "POST", body: formData });
       setStatus({ text: "登录成功，正在跳转...", type: "success" });
-      onLoginSuccess?.(String(formData.get("username") || "admin"));
+      onLoginSuccess?.(rawUsername || "admin");
       navigate("/app/tools");
     } catch (error) {
-      setStatus({ text: error.message, type: "error" });
+      const message = String(error?.message || "");
+      if (message.includes("账号或密码错误")) {
+        setStatus({ text: "账号或密码错误，请重新输入。", type: "error" });
+      } else if (message.includes("Unauthorized")) {
+        setStatus({ text: "会话已失效，请重新登录。", type: "error" });
+      } else if (message.includes("认证服务")) {
+        setStatus({ text: "认证服务暂时不可用，请稍后重试。", type: "error" });
+      } else {
+        setStatus({ text: message || "登录失败，请稍后重试。", type: "error" });
+      }
     } finally {
       setLoading(false);
     }
@@ -2033,17 +2047,27 @@ function ProjectWorkspace({ tool, projectId, navigate }) {
 
 export default function AppPage() {
   const { route, navigate } = useRouterState();
-  const [auth, setAuth] = useState({ loading: true, authenticated: false, username: "" });
+  const [auth, setAuth] = useState({ phase: "booting", authenticated: false, username: "", error: "" });
 
   const refreshAuth = useCallback(async () => {
+    setAuth((prev) => ({ ...prev, phase: "booting", error: "" }));
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 6000);
     try {
       const resp = await fetch("/api/v1/auth/me", { credentials: "include", signal: controller.signal });
       const data = await resp.json().catch(() => ({}));
-      setAuth({ loading: false, authenticated: Boolean(data.authenticated), username: data.username || "" });
-    } catch (_) {
-      setAuth({ loading: false, authenticated: false, username: "" });
+      if (Boolean(data.authenticated)) {
+        setAuth({ phase: "authenticated", authenticated: true, username: data.username || "", error: "" });
+      } else {
+        setAuth({ phase: "unauthenticated", authenticated: false, username: "", error: "" });
+      }
+    } catch (error) {
+      setAuth({
+        phase: "error",
+        authenticated: false,
+        username: "",
+        error: String(error?.message || "认证检查失败"),
+      });
     } finally {
       clearTimeout(timer);
     }
@@ -2052,14 +2076,14 @@ export default function AppPage() {
   useEffect(() => { refreshAuth(); }, [refreshAuth]);
 
   useEffect(() => {
-    if (auth.loading) return;
-    if (!auth.authenticated && route.page !== "login") navigate("/app/login");
-    if (auth.authenticated && route.page === "login") navigate("/app/tools");
-  }, [auth, route.page, navigate]);
+    if (auth.phase === "booting") return;
+    if (auth.phase === "unauthenticated" && route.page !== "login") navigate("/app/login");
+    if (auth.phase === "authenticated" && route.page === "login") navigate("/app/tools");
+  }, [auth.phase, route.page, navigate]);
 
   const logout = async () => {
     await fetch("/api/v1/auth/logout", { method: "POST", credentials: "include" }).catch(() => undefined);
-    setAuth({ loading: false, authenticated: false, username: "" });
+    setAuth({ phase: "unauthenticated", authenticated: false, username: "", error: "" });
     navigate("/app/login");
   };
 
@@ -2068,13 +2092,13 @@ export default function AppPage() {
       <LoginPage
         navigate={navigate}
         onLoginSuccess={(username) => {
-          setAuth({ loading: false, authenticated: true, username: username || "admin" });
+          setAuth({ phase: "authenticated", authenticated: true, username: username || "admin", error: "" });
         }}
       />
     );
   }
 
-  if (auth.loading) {
+  if (auth.phase === "booting") {
     return (
       <div className="app-main">
         <section className="card"><div className="status-banner">加载用户信息...</div></section>
@@ -2082,7 +2106,33 @@ export default function AppPage() {
     );
   }
 
-  if (!auth.authenticated) return null;
+  if (auth.phase === "error") {
+    return (
+      <div className="app-main">
+        <section className="card">
+          <h1>登录状态异常</h1>
+          <div className="status-banner error">{auth.error || "认证服务不可用，请重试。"}</div>
+          <div className="toolbar" style={{ marginTop: 10 }}>
+            <button type="button" className="btn-primary" onClick={refreshAuth}>重新检查</button>
+            <button type="button" className="btn-secondary" onClick={() => navigate("/app/login")}>返回登录</button>
+          </div>
+        </section>
+      </div>
+    );
+  }
+
+  if (!auth.authenticated) {
+    return (
+      <div className="app-main">
+        <section className="card">
+          <div className="status-banner warning">会话已失效，正在跳转登录...</div>
+          <div className="toolbar" style={{ marginTop: 10 }}>
+            <button type="button" className="btn-primary" onClick={() => navigate("/app/login")}>去登录</button>
+          </div>
+        </section>
+      </div>
+    );
+  }
 
   let content = <ToolsHome navigate={navigate} />;
   if (route.page === "assets") {

@@ -5,11 +5,12 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import time
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -61,6 +62,7 @@ from app.schemas import (
     UpdatePlanRequest,
 )
 from app.services.pipeline_service import PipelineService
+from app.services.auth_service import AuthService, AuthSession
 from app.utils.image_tools import get_image_dimensions
 from app.utils.logging_setup import setup_logging
 
@@ -83,6 +85,8 @@ app.add_middleware(
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 AUTH_COOKIE_NAME = "photo2video_session"
+AUTH_ACCESS_COOKIE_NAME = "access_token"
+AUTH_REFRESH_COOKIE_NAME = "refresh_token"
 TOOL_SLUG_MAP: dict[ToolType, str] = {
     ToolType.intro_video_multi_script: "intro-video",
     ToolType.product_image_suite: "product-image",
@@ -98,6 +102,7 @@ TOOL_BY_TYPE_TEXT: dict[ToolType, str] = {
     ToolType.quick_video_15s: "15秒场景短片工坊",
     ToolType.multi_angle_camera: "多角度展品工坊",
 }
+auth_service = AuthService(settings)
 
 
 def _now_ts() -> int:
@@ -148,6 +153,91 @@ def _decode_session_token(token: str | None) -> str | None:
     return username
 
 
+def _request_id(request: Request) -> str:
+    value = getattr(request.state, "request_id", "")
+    return value or str(uuid4())
+
+
+def _json_error(
+    *,
+    request: Request,
+    status_code: int,
+    detail: str,
+    code: str | None = None,
+) -> JSONResponse:
+    payload: dict[str, str] = {"detail": detail, "request_id": _request_id(request)}
+    if code:
+        payload["code"] = code
+    return JSONResponse(status_code=status_code, content=payload)
+
+
+def _session_max_age_seconds() -> int:
+    if settings.auth_provider == "supabase":
+        days = max(1, int(settings.auth_session_days or 7))
+        return days * 24 * 3600
+    return max(1, settings.auth_session_hours) * 3600
+
+
+def _cookie_secure(request: Request | None = None) -> bool:
+    if os.getenv("VERCEL"):
+        return True
+    if request is None:
+        return False
+    forwarded_proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
+    scheme = (request.url.scheme or "").lower()
+    return forwarded_proto == "https" or scheme == "https"
+
+
+def _set_supabase_auth_cookies(
+    response: Response,
+    session: AuthSession,
+    *,
+    request: Request | None = None,
+) -> None:
+    max_age = _session_max_age_seconds()
+    secure = _cookie_secure(request)
+    response.set_cookie(
+        key=AUTH_ACCESS_COOKIE_NAME,
+        value=session.access_token,
+        httponly=True,
+        secure=secure,
+        samesite="lax",
+        max_age=max_age,
+        path="/",
+    )
+    response.set_cookie(
+        key=AUTH_REFRESH_COOKIE_NAME,
+        value=session.refresh_token,
+        httponly=True,
+        secure=secure,
+        samesite="lax",
+        max_age=max_age,
+        path="/",
+    )
+
+
+def _clear_auth_cookies(response: Response) -> None:
+    response.delete_cookie(AUTH_COOKIE_NAME, path="/")
+    response.delete_cookie(AUTH_ACCESS_COOKIE_NAME, path="/")
+    response.delete_cookie(AUTH_REFRESH_COOKIE_NAME, path="/")
+
+
+def _decode_jwt_exp(token: str | None) -> str | None:
+    if not token or "." not in token:
+        return None
+    try:
+        _, payload_b64, _ = token.split(".", 2)
+        padding = "=" * (-len(payload_b64) % 4)
+        payload_json = base64.urlsafe_b64decode((payload_b64 + padding).encode("utf-8")).decode("utf-8")
+        payload = json.loads(payload_json)
+        exp = int(payload.get("exp") or 0)
+        if exp <= 0:
+            return None
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(exp))
+    except Exception:
+        return None
+
+
 def _auth_exempt_path(path: str) -> bool:
     if path in {
         "/healthz",
@@ -169,19 +259,50 @@ def _auth_exempt_path(path: str) -> bool:
 
 
 @app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    request_id = request.headers.get("x-request-id") or str(uuid4())
+    request.state.request_id = request_id
+    response = await call_next(request)
+    response.headers["x-request-id"] = request_id
+    return response
+
+
+@app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     if not settings.auth_enabled or _auth_exempt_path(request.url.path):
         return await call_next(request)
 
-    username = _decode_session_token(request.cookies.get(AUTH_COOKIE_NAME))
-    if username:
-        request.state.username = username
-        return await call_next(request)
+    if settings.auth_provider == "supabase":
+        access_token = request.cookies.get(AUTH_ACCESS_COOKIE_NAME)
+        refresh_token = request.cookies.get(AUTH_REFRESH_COOKIE_NAME)
+        if access_token and auth_service.is_configured:
+            user = await auth_service.verify_access_token(access_token)
+            if user:
+                request.state.username = str(user.get("username") or "")
+                return await call_next(request)
+        if refresh_token and auth_service.is_configured:
+            try:
+                session = await auth_service.refresh_session(refresh_token)
+                user = await auth_service.verify_access_token(session.access_token)
+                if user:
+                    request.state.username = str(user.get("username") or session.username or "")
+                    response = await call_next(request)
+                    _set_supabase_auth_cookies(response, session, request=request)
+                    return response
+            except Exception as exc:  # pragma: no cover - network instability
+                logger.warning("Auth refresh failed (request_id=%s): %s", _request_id(request), exc)
+    else:
+        username = _decode_session_token(request.cookies.get(AUTH_COOKIE_NAME))
+        if username:
+            request.state.username = username
+            return await call_next(request)
 
     if request.url.path.startswith("/api/"):
-        return JSONResponse(
+        return _json_error(
+            request=request,
             status_code=status.HTTP_401_UNAUTHORIZED,
-            content={"detail": "Unauthorized. Please login first."},
+            detail="Unauthorized. Please login first.",
+            code="UNAUTHORIZED",
         )
     return RedirectResponse(url="/app/login", status_code=status.HTTP_302_FOUND)
 
@@ -238,40 +359,106 @@ def app_spa(full_path: str) -> FileResponse:
 
 
 @app.post("/api/v1/auth/login")
-def login(
+async def login(
+    request: Request,
     username: str = Form(...),
     password: str = Form(...),
 ) -> JSONResponse:
     if not settings.auth_enabled:
-        return JSONResponse(content={"ok": True, "username": "dev"})
+        return JSONResponse(content={"ok": True, "username": "dev", "expires_in": _session_max_age_seconds()})
+    if settings.auth_provider == "supabase":
+        if not auth_service.is_configured:
+            return _json_error(
+                request=request,
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Supabase auth is not configured.",
+                code="AUTH_NOT_CONFIGURED",
+            )
+        try:
+            session = await auth_service.sign_in_with_password(username, password)
+        except ValueError:
+            return _json_error(
+                request=request,
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="账号或密码错误",
+                code="INVALID_CREDENTIALS",
+            )
+        except Exception as exc:  # pragma: no cover - network instability
+            logger.exception("Supabase login failed (request_id=%s): %s", _request_id(request), exc)
+            return _json_error(
+                request=request,
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="认证服务暂时不可用，请稍后重试",
+                code="AUTH_PROVIDER_ERROR",
+            )
+        response = JSONResponse(
+            content={
+                "ok": True,
+                "username": session.username or settings.admin_username,
+                "expires_in": _session_max_age_seconds(),
+            }
+        )
+        _set_supabase_auth_cookies(response, session, request=request)
+        return response
+
     if username != settings.admin_username or password != settings.admin_password:
-        raise HTTPException(status_code=401, detail="用户名或密码错误")
+        return _json_error(
+            request=request,
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="账号或密码错误",
+            code="INVALID_CREDENTIALS",
+        )
     token = _create_session_token(username=username)
-    response = JSONResponse(content={"ok": True, "username": username})
+    response = JSONResponse(
+        content={"ok": True, "username": username, "expires_in": _session_max_age_seconds()}
+    )
     response.set_cookie(
         key=AUTH_COOKIE_NAME,
         value=token,
         httponly=True,
+        secure=_cookie_secure(request),
         samesite="lax",
-        max_age=max(1, settings.auth_session_hours) * 3600,
+        max_age=_session_max_age_seconds(),
         path="/",
     )
     return response
 
 
 @app.post("/api/v1/auth/logout")
-def logout() -> JSONResponse:
+async def logout(request: Request) -> JSONResponse:
+    if settings.auth_provider == "supabase" and settings.auth_enabled:
+        access_token = request.cookies.get(AUTH_ACCESS_COOKIE_NAME)
+        try:
+            await auth_service.sign_out(access_token or "")
+        except Exception as exc:  # pragma: no cover - network instability
+            logger.warning("Supabase logout failed (request_id=%s): %s", _request_id(request), exc)
     response = JSONResponse(content={"ok": True})
-    response.delete_cookie(AUTH_COOKIE_NAME, path="/")
+    _clear_auth_cookies(response)
     return response
 
 
 @app.get("/api/v1/auth/me")
-def auth_me(request: Request) -> dict[str, str | bool]:
+async def auth_me(request: Request) -> dict[str, str | bool | None]:
     if not settings.auth_enabled:
-        return {"authenticated": True, "username": "dev"}
+        return {"authenticated": True, "username": "dev", "session_expires_at": None}
+    if settings.auth_provider == "supabase" and auth_service.is_configured:
+        access_token = request.cookies.get(AUTH_ACCESS_COOKIE_NAME)
+        if not access_token:
+            return {"authenticated": False, "username": "", "session_expires_at": None}
+        user = await auth_service.verify_access_token(access_token)
+        if not user:
+            return {"authenticated": False, "username": "", "session_expires_at": None}
+        return {
+            "authenticated": True,
+            "username": str(user.get("username") or settings.admin_username),
+            "session_expires_at": _decode_jwt_exp(access_token),
+        }
     username = _decode_session_token(request.cookies.get(AUTH_COOKIE_NAME))
-    return {"authenticated": bool(username), "username": username or ""}
+    return {
+        "authenticated": bool(username),
+        "username": username or "",
+        "session_expires_at": _decode_jwt_exp(request.cookies.get(AUTH_COOKIE_NAME)),
+    }
 
 
 @app.get("/tasks", include_in_schema=False)
