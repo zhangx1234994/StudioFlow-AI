@@ -764,6 +764,7 @@ function AssetsPage({ navigate }) {
 function MultiAnglePad({ values, setValues, previewSrc }) {
   const mountRef = useRef(null);
   const runtimeRef = useRef(null);
+  const [initError, setInitError] = useState("");
 
   const toYaw360 = (yaw) => {
     const raw = Number(yaw || 0);
@@ -820,17 +821,26 @@ function MultiAnglePad({ values, setValues, previewSrc }) {
   useEffect(() => {
     const mount = mountRef.current;
     if (!mount) return;
-
-    const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x12151f);
-    const camera = new THREE.PerspectiveCamera(50, mount.clientWidth / mount.clientHeight, 0.1, 100);
-    camera.position.set(4.8, 3.2, 4.8);
-    camera.lookAt(0, 0.8, 0);
-    const renderer = new THREE.WebGLRenderer({ antialias: true });
-    renderer.setSize(mount.clientWidth, mount.clientHeight);
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-    mount.innerHTML = "";
-    mount.appendChild(renderer.domElement);
+    setInitError("");
+    let scene;
+    let camera;
+    let renderer;
+    try {
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x12151f);
+      camera = new THREE.PerspectiveCamera(50, mount.clientWidth / mount.clientHeight, 0.1, 100);
+      camera.position.set(4.8, 3.2, 4.8);
+      camera.lookAt(0, 0.8, 0);
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(mount.clientWidth, mount.clientHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+      mount.innerHTML = "";
+      mount.appendChild(renderer.domElement);
+    } catch (error) {
+      setInitError(`3D预览不可用：${String(error?.message || "浏览器不支持 WebGL")}`);
+      runtimeRef.current = null;
+      return;
+    }
 
     scene.add(new THREE.AmbientLight(0xffffff, 0.7));
     const dir = new THREE.DirectionalLight(0xffffff, 0.6);
@@ -1018,18 +1028,32 @@ function MultiAnglePad({ values, setValues, previewSrc }) {
       rt.targetPlaneMaterial.needsUpdate = true;
       return;
     }
-    new THREE.TextureLoader().load(previewSrc, (texture) => {
-      texture.minFilter = THREE.LinearFilter;
-      texture.magFilter = THREE.LinearFilter;
-      rt.targetPlaneMaterial.map = texture;
+    try {
+      new THREE.TextureLoader().load(
+        previewSrc,
+        (texture) => {
+          texture.minFilter = THREE.LinearFilter;
+          texture.magFilter = THREE.LinearFilter;
+          rt.targetPlaneMaterial.map = texture;
+          rt.targetPlaneMaterial.needsUpdate = true;
+        },
+        undefined,
+        () => {
+          rt.targetPlaneMaterial.map = null;
+          rt.targetPlaneMaterial.needsUpdate = true;
+        }
+      );
+    } catch (_) {
+      rt.targetPlaneMaterial.map = null;
       rt.targetPlaneMaterial.needsUpdate = true;
-    });
+    }
   }, [previewSrc]);
 
   return (
     <div className="camera-pad-wrap">
       <div className="camera-panel-title">3D 机位控制</div>
       <div className="camera-viewport" ref={mountRef} />
+      {initError && <div className="status-banner warning" style={{ marginTop: 8 }}>{initError}</div>}
       <div className="camera-token">
         {`<sks> ${azimuthLabel(toYaw360(values.camera_yaw))} ${elevationLabel(Math.max(-30, Math.min(60, Number(values.camera_pitch || 0))))} ${values.camera_distance}`}
       </div>
