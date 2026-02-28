@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import time
 from pathlib import Path
 from uuid import uuid4
@@ -66,6 +67,7 @@ from app.utils.logging_setup import setup_logging
 
 settings = get_settings()
 setup_logging(settings)
+logger = logging.getLogger(__name__)
 app = FastAPI(title="AI摄影棚", version="0.3.0")
 static_dir = Path(__file__).parent / "static"
 static_dir.mkdir(parents=True, exist_ok=True)
@@ -768,13 +770,20 @@ def list_projects(
 
     task_items: list[ProjectTaskItem] = []
     for item in projects:
-        progress = service.get_project_progress(item.project_id)
-        percent = progress.progress_percent_weighted
-        label = (
-            f"{progress.progress_profile} | {progress.completion_criteria}"
-            if progress.completion_criteria
-            else progress.current_stage
-        )
+        try:
+            progress = service.get_project_progress(item.project_id)
+            percent = progress.progress_percent_weighted
+            current_stage = progress.current_stage
+            label = (
+                f"{progress.progress_profile} | {progress.completion_criteria}"
+                if progress.completion_criteria
+                else progress.current_stage
+            )
+        except Exception as exc:  # pragma: no cover - defensive fallback for legacy/broken records
+            logger.exception("Failed to compute progress for project %s: %s", item.project_id, exc)
+            percent = 0
+            current_stage = "failed" if item.status.value == "failed" else "plan"
+            label = "progress_unavailable | 使用默认进度兜底"
         task_items.append(
             ProjectTaskItem(
                 project_id=item.project_id,
@@ -784,7 +793,7 @@ def list_projects(
                 template_name=item.template_name,
                 status=item.status,
                 storyboard_status=item.storyboard_status,
-                current_stage=progress.current_stage,
+                current_stage=current_stage,
                 progress_percent=percent,
                 progress_label=label,
                 batch_group_id=item.batch_group_id,
@@ -914,8 +923,20 @@ def list_tool_tasks(
     items = service.list_projects_by_tool(tool_type=tool_type, limit=limit, query=query)
     output: list[ProjectTaskItem] = []
     for item in items:
-        progress = service.get_project_progress(item.project_id)
-        percent = progress.progress_percent_weighted
+        try:
+            progress = service.get_project_progress(item.project_id)
+            percent = progress.progress_percent_weighted
+            current_stage = progress.current_stage
+            progress_label = (
+                f"{progress.progress_profile} | {progress.completion_criteria}"
+                if progress.completion_criteria
+                else progress.current_stage
+            )
+        except Exception as exc:  # pragma: no cover - defensive fallback for legacy/broken records
+            logger.exception("Failed to compute tool progress for project %s: %s", item.project_id, exc)
+            percent = 0
+            current_stage = "failed" if item.status.value == "failed" else "plan"
+            progress_label = "progress_unavailable | 使用默认进度兜底"
         output.append(
             ProjectTaskItem(
                 project_id=item.project_id,
@@ -925,13 +946,9 @@ def list_tool_tasks(
                 template_name=item.template_name,
                 status=item.status,
                 storyboard_status=item.storyboard_status,
-                current_stage=progress.current_stage,
+                current_stage=current_stage,
                 progress_percent=percent,
-                progress_label=(
-                    f"{progress.progress_profile} | {progress.completion_criteria}"
-                    if progress.completion_criteria
-                    else progress.current_stage
-                ),
+                progress_label=progress_label,
                 batch_group_id=item.batch_group_id,
                 render_id=item.render_id,
                 updated_at=item.updated_at,
