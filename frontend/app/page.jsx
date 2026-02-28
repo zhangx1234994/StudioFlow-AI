@@ -331,7 +331,16 @@ function useRouterState() {
 }
 
 function LoginPage({ navigate, onLoginSuccess }) {
-  const [status, setStatus] = useState({ text: "请输入账号密码", type: "" });
+  const initialStatus = (() => {
+    if (typeof window === "undefined") return { text: "请输入账号密码", type: "" };
+    const params = new URLSearchParams(window.location.search || "");
+    const error = params.get("error") || "";
+    if (error === "invalid_credentials") return { text: "账号或密码错误，请重新输入。", type: "error" };
+    if (error === "auth_not_configured") return { text: "认证服务未配置，请联系管理员。", type: "error" };
+    if (error === "auth_provider_error") return { text: "认证服务暂时不可用，请稍后重试。", type: "error" };
+    return { text: "请输入账号密码", type: "" };
+  })();
+  const [status, setStatus] = useState(initialStatus);
   const [loading, setLoading] = useState(false);
 
   const submit = async (event) => {
@@ -370,7 +379,7 @@ function LoginPage({ navigate, onLoginSuccess }) {
       <section className="card">
         <h1>登录 AI摄影棚</h1>
         <p className="card-subtitle">默认账号：admin / admin123</p>
-        <form className="grid" onSubmit={submit}>
+        <form className="grid" onSubmit={submit} method="post" action="/app/login">
           <div className="field"><label>用户名</label><input name="username" defaultValue="admin" required /></div>
           <div className="field"><label>密码</label><input name="password" type="password" defaultValue="admin123" required /></div>
           <button type="submit" className="btn-primary" disabled={loading}>{loading ? "登录中..." : "登录"}</button>

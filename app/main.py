@@ -9,6 +9,7 @@ import os
 import time
 from pathlib import Path
 from uuid import uuid4
+from urllib.parse import quote_plus
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -380,16 +381,36 @@ def app_next_assets(full_path: str) -> FileResponse:
     return _frontend_static_asset(f"_next/{full_path.strip('/')}")
 
 
-@app.post("/api/v1/auth/login")
-async def login(
+async def _login_response(
+    *,
     request: Request,
-    username: str = Form(...),
-    password: str = Form(...),
-) -> JSONResponse:
+    username: str,
+    password: str,
+    redirect: bool,
+) -> Response:
+    def _redirect(url: str) -> RedirectResponse:
+        return RedirectResponse(url=url, status_code=status.HTTP_302_FOUND)
+
+    def _success_response(session_username: str, session: AuthSession | None = None) -> Response:
+        if redirect:
+            response = _redirect("/app/tools")
+        else:
+            response = JSONResponse(
+                content={"ok": True, "username": session_username, "expires_in": _session_max_age_seconds()}
+            )
+        if session is not None:
+            _set_supabase_auth_cookies(response, session, request=request)
+        return response
+
     if not settings.auth_enabled:
+        if redirect:
+            return _redirect("/app/tools")
         return JSONResponse(content={"ok": True, "username": "dev", "expires_in": _session_max_age_seconds()})
+
     if settings.auth_provider == "supabase":
         if not auth_service.is_configured:
+            if redirect:
+                return _redirect("/app/login?error=auth_not_configured")
             return _json_error(
                 request=request,
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -399,6 +420,8 @@ async def login(
         try:
             session = await auth_service.sign_in_with_password(username, password)
         except ValueError:
+            if redirect:
+                return _redirect("/app/login?error=invalid_credentials")
             return _json_error(
                 request=request,
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -407,23 +430,19 @@ async def login(
             )
         except Exception as exc:  # pragma: no cover - network instability
             logger.exception("Supabase login failed (request_id=%s): %s", _request_id(request), exc)
+            if redirect:
+                return _redirect("/app/login?error=auth_provider_error")
             return _json_error(
                 request=request,
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail="认证服务暂时不可用，请稍后重试",
                 code="AUTH_PROVIDER_ERROR",
             )
-        response = JSONResponse(
-            content={
-                "ok": True,
-                "username": session.username or settings.admin_username,
-                "expires_in": _session_max_age_seconds(),
-            }
-        )
-        _set_supabase_auth_cookies(response, session, request=request)
-        return response
+        return _success_response(session.username or settings.admin_username, session)
 
     if username != settings.admin_username or password != settings.admin_password:
+        if redirect:
+            return _redirect("/app/login?error=invalid_credentials")
         return _json_error(
             request=request,
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -431,9 +450,12 @@ async def login(
             code="INVALID_CREDENTIALS",
         )
     token = _create_session_token(username=username)
-    response = JSONResponse(
-        content={"ok": True, "username": username, "expires_in": _session_max_age_seconds()}
-    )
+    if redirect:
+        response: Response = _redirect("/app/tools")
+    else:
+        response = JSONResponse(
+            content={"ok": True, "username": username, "expires_in": _session_max_age_seconds()}
+        )
     response.set_cookie(
         key=AUTH_COOKIE_NAME,
         value=token,
@@ -442,6 +464,40 @@ async def login(
         samesite="lax",
         max_age=_session_max_age_seconds(),
         path="/",
+    )
+    return response
+
+
+@app.post("/api/v1/auth/login")
+async def login(
+    request: Request,
+    username: str = Form(...),
+    password: str = Form(...),
+) -> JSONResponse:
+    response = await _login_response(
+        request=request,
+        username=username,
+        password=password,
+        redirect=False,
+    )
+    if isinstance(response, JSONResponse):
+        return response
+    # Fallback guard; /api login should always return JSON.
+    detail = quote_plus("Unexpected login response type")
+    return JSONResponse(status_code=500, content={"detail": detail, "code": "AUTH_RESPONSE_INVALID"})
+
+
+@app.post("/app/login", include_in_schema=False)
+async def app_login(
+    request: Request,
+    username: str = Form(...),
+    password: str = Form(...),
+) -> Response:
+    response = await _login_response(
+        request=request,
+        username=username,
+        password=password,
+        redirect=True,
     )
     return response
 
