@@ -330,7 +330,7 @@ function useRouterState() {
   return { pathname, route: parseRoute(pathname), navigate };
 }
 
-function LoginPage({ navigate }) {
+function LoginPage({ navigate, onLoginSuccess }) {
   const [status, setStatus] = useState({ text: "请输入账号密码", type: "" });
   const [loading, setLoading] = useState(false);
 
@@ -342,6 +342,7 @@ function LoginPage({ navigate }) {
     try {
       await apiFetch("/api/v1/auth/login", { method: "POST", body: formData });
       setStatus({ text: "登录成功，正在跳转...", type: "success" });
+      onLoginSuccess?.(String(formData.get("username") || "admin"));
       navigate("/app/tools");
     } catch (error) {
       setStatus({ text: error.message, type: "error" });
@@ -2063,7 +2064,14 @@ export default function AppPage() {
   };
 
   if (route.page === "login") {
-    return <LoginPage navigate={navigate} />;
+    return (
+      <LoginPage
+        navigate={navigate}
+        onLoginSuccess={(username) => {
+          setAuth({ loading: false, authenticated: true, username: username || "admin" });
+        }}
+      />
+    );
   }
 
   if (auth.loading) {
