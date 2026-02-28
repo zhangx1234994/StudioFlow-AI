@@ -9,6 +9,7 @@ from typing import Any, Awaitable, Callable
 import httpx
 
 from app.config import Settings
+from app.services.oss_service import OssService
 from app.schemas import PromptItem, ScriptOption, ShotPlan, ShotReference
 
 logger = logging.getLogger(__name__)
@@ -17,6 +18,7 @@ logger = logging.getLogger(__name__)
 class ReferenceImageService:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
+        self._oss = OssService(settings)
 
     async def generate_storyboard(
         self,
@@ -64,12 +66,17 @@ class ReferenceImageService:
                     image_output_format=image_output_format,
                 )
             if image_url:
+                persisted_url = await self._persist_generated_image(
+                    project_id=project_id,
+                    shot_id=shot.shot_id,
+                    source_url=image_url,
+                )
                 return (
                     shot.shot_id,
                     ShotReference(
                         shot_id=shot.shot_id,
                         source="generated",
-                        image_url=image_url,
+                        image_url=persisted_url,
                         local_path=None,
                         prompt=prompt,
                     ),
@@ -135,10 +142,15 @@ class ReferenceImageService:
             image_output_format=image_output_format,
         )
         if image_url:
+            persisted_url = await self._persist_generated_image(
+                project_id=image_path.stem,
+                shot_id=shot.shot_id,
+                source_url=image_url,
+            )
             return ShotReference(
                 shot_id=shot.shot_id,
                 source="generated",
-                image_url=image_url,
+                image_url=persisted_url,
                 local_path=None,
                 prompt=prompt,
             )
@@ -216,12 +228,17 @@ class ReferenceImageService:
                     image_output_format=image_output_format,
                 )
             if image_url:
+                persisted_url = await self._persist_generated_image(
+                    project_id=image_path.stem,
+                    shot_id=item.shot_id,
+                    source_url=image_url,
+                )
                 return (
                     item.shot_id,
                     ShotReference(
                         shot_id=item.shot_id,
                         source="generated",
-                        image_url=image_url,
+                        image_url=persisted_url,
                         local_path=None,
                         prompt=item.prompt,
                     ),
@@ -360,6 +377,17 @@ class ReferenceImageService:
         return None
 
     async def _upload_image(self, image_path: Path) -> str:
+        if self._oss.enabled:
+            try:
+                object_key = self._oss.object_key("inputs", image_path.name)
+                return await self._oss.upload_file(
+                    local_path=image_path,
+                    object_key=object_key,
+                    content_type="application/octet-stream",
+                )
+            except Exception as exc:  # pragma: no cover - network instability
+                logger.warning("OSS source upload failed, fallback to kie upload: %s", exc)
+
         headers = {"Authorization": f"Bearer {self._settings.kie_api_key}"}
         candidates = [
             self._settings.kie_upload_base_url.rstrip("/"),
@@ -389,6 +417,23 @@ class ReferenceImageService:
                 errors.append(f"{url}: {exc}")
 
         raise RuntimeError(f"Upload response missing URL: {' | '.join(errors)}")
+
+    async def _persist_generated_image(self, project_id: str, shot_id: str, source_url: str) -> str:
+        if not self._oss.enabled:
+            return source_url
+        try:
+            object_key = self._oss.build_key_from_url(
+                source_url,
+                "generated",
+                "images",
+                project_id,
+                shot_id,
+                default_ext=".png",
+            )
+            return await self._oss.mirror_from_url(source_url=source_url, object_key=object_key)
+        except Exception as exc:  # pragma: no cover - network instability
+            logger.warning("Persist generated image to OSS failed, keep temporary URL: %s", exc)
+            return source_url
 
     def _extract_uploaded_file_url(self, payload: dict[str, Any]) -> str | None:
         data = payload.get("data")

@@ -39,4 +39,5 @@ def get_pipeline_service() -> PipelineService:
         reference_image_service=ReferenceImageService(settings),
         assembly_service=AssemblyService(settings),
         storage_root=settings.storage_root,
+        settings=settings,
     )

@@ -47,6 +47,13 @@ class Settings(BaseSettings):
     poll_max_attempts: int = 180
     video_task_concurrency: int = 20
     vl_overall_timeout_seconds: float = 45.0
+    oss_access_key: str | None = None
+    oss_secret_key: str | None = None
+    oss_bucket: str | None = None
+    oss_region: str | None = None
+    oss_endpoint: str | None = None
+    oss_public_domain: str | None = None
+    oss_root_prefix: str = "photo2video"
 
     model_config = SettingsConfigDict(
         env_prefix="MVP_",
@@ -60,6 +67,13 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     settings = Settings()
+    settings.oss_access_key = settings.oss_access_key or os.getenv("OSS_ACCESS_KEY")
+    settings.oss_secret_key = settings.oss_secret_key or os.getenv("OSS_SECRET_KEY")
+    settings.oss_bucket = settings.oss_bucket or os.getenv("OSS_BUCKET")
+    settings.oss_region = settings.oss_region or os.getenv("OSS_REGION")
+    settings.oss_endpoint = settings.oss_endpoint or os.getenv("OSS_ENDPOINT")
+    settings.oss_public_domain = settings.oss_public_domain or os.getenv("OSS_PUBLIC_DOMAIN")
+    settings.oss_root_prefix = settings.oss_root_prefix or os.getenv("OSS_ROOT_PREFIX", "photo2video")
     if not settings.redis_url:
         settings.redis_url = (
             os.getenv("KV_URL")

@@ -49,8 +49,10 @@ from app.schemas import (
     VideoPromptScript,
     VisualInsight,
 )
+from app.config import Settings
 from app.services.assembly_service import AssemblyService
 from app.services.compliance_service import ComplianceService
+from app.services.oss_service import OssService
 from app.services.reference_image_service import ReferenceImageService
 from app.services.sora_service import KieSoraService
 from app.services.volc_service import VolcScriptService
@@ -80,6 +82,7 @@ class PipelineService:
         reference_image_service: ReferenceImageService,
         assembly_service: AssemblyService,
         storage_root: Path,
+        settings: Settings | None = None,
     ) -> None:
         self._store = store
         self._script_service = script_service
@@ -88,6 +91,7 @@ class PipelineService:
         self._reference_image = reference_image_service
         self._assembly = assembly_service
         self._storage_root = storage_root
+        self._oss = OssService(settings or script_service._settings)
         self._storyboard_tasks: dict[str, asyncio.Task[None]] = {}
         self._render_tasks: dict[str, asyncio.Task[None]] = {}
         self._image_tasks: dict[str, asyncio.Task[None]] = {}
@@ -112,6 +116,17 @@ class PipelineService:
     ) -> ProjectRecord:
         project_id = str(uuid4())
         image_path = self._write_image(project_id, image_bytes, image_suffix)
+        resolved_image_public_url = image_public_url
+        if not resolved_image_public_url and self._oss.enabled:
+            try:
+                object_key = self._oss.object_key("inputs", project_id, f"source{image_suffix or '.png'}")
+                resolved_image_public_url = await self._oss.upload_file(
+                    local_path=image_path,
+                    object_key=object_key,
+                    content_type=image_mime,
+                )
+            except Exception as exc:  # pragma: no cover - network instability
+                logger.warning("Upload source image to OSS failed: %s", exc)
 
         now = utc_now()
         project = ProjectRecord(
@@ -123,7 +138,7 @@ class PipelineService:
             updated_at=now,
             image_path=str(image_path),
             source_image_b64=base64.b64encode(image_bytes).decode("utf-8"),
-            image_public_url=image_public_url,
+            image_public_url=resolved_image_public_url,
             brief=brief,
             scenario_type=scenario_type,
             template_name=template_name,
@@ -147,7 +162,7 @@ class PipelineService:
             created_at=now,
             updated_at=now,
             local_path=str(image_path),
-            image_url=image_public_url,
+            image_url=resolved_image_public_url,
             tags=["input", tool_type.value],
             metadata={"mime": image_mime, "suffix": image_suffix},
         )
@@ -167,6 +182,17 @@ class PipelineService:
             ref_mime = str(ref.get("image_mime") or "image/png")
             ref_role = str(ref.get("role") or f"reference_{idx}").strip() or f"reference_{idx}"
             ref_path = self._write_image(f"{project_id}_ref_{idx}", bytes(ref_bytes), ref_suffix)
+            ref_public_url: str | None = None
+            if self._oss.enabled:
+                try:
+                    object_key = self._oss.object_key("inputs", project_id, "references", f"{ref_role}_{idx}{ref_suffix}")
+                    ref_public_url = await self._oss.upload_file(
+                        local_path=ref_path,
+                        object_key=object_key,
+                        content_type=ref_mime,
+                    )
+                except Exception as exc:  # pragma: no cover - network instability
+                    logger.warning("Upload reference image to OSS failed: %s", exc)
             ref_asset = AssetRecord(
                 asset_id=str(uuid4()),
                 project_id=project_id,
@@ -177,7 +203,7 @@ class PipelineService:
                 created_at=now,
                 updated_at=now,
                 local_path=str(ref_path),
-                image_url=None,
+                image_url=ref_public_url,
                 tags=["input", "reference", ref_role, tool_type.value],
                 metadata={"mime": ref_mime, "suffix": ref_suffix, "role": ref_role},
             )

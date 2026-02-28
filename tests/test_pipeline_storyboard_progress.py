@@ -97,6 +97,7 @@ async def test_storyboard_progress_updates_references_incrementally(tmp_path: Pa
         reference_image_service=_FakeReferenceImageService(),
         assembly_service=AssemblyService(settings),
         storage_root=tmp_path,
+        settings=settings,
     )
 
     image_path = tmp_path / "uploads" / "project-1.png"

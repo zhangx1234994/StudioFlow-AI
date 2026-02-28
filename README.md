@@ -65,5 +65,30 @@ npm --prefix frontend run build
 
 ## Vercel Notes
 
-仓库已包含 `api/index.py` 与 `vercel.json`，后续可通过 Git 接入 Vercel。
-首发阶段建议继续使用 mock provider 验证全链路交互，再切换真实模型密钥与持久化方案。
+仓库已包含 `api/index.py`、`vercel.json` 与 `requirements.txt`，可直接通过 Git 接入 Vercel。
+
+### Deploy 流程
+
+1. 在 Vercel 里 `Add New Project`，选择本仓库。
+2. Framework 保持 `Other`（无需改 Root Directory）。
+3. Build Command 使用仓库内配置：`npm --prefix frontend ci && npm --prefix frontend run build`。
+4. 部署后访问：`/app/tools`。
+
+### 必填环境变量（Vercel）
+
+- `MVP_USE_MOCK_PROVIDERS`（测试建议先设 `true`）
+- `MVP_AUTH_ENABLED`
+- `MVP_ADMIN_USERNAME`
+- `MVP_ADMIN_PASSWORD`
+- `MVP_AUTH_SECRET`
+- `MVP_VOLC_API_KEY`
+- `MVP_KIE_API_KEY`
+- `MVP_OSS_ACCESS_KEY`
+- `MVP_OSS_SECRET_KEY`
+- `MVP_OSS_BUCKET`
+- `MVP_OSS_REGION`
+- `MVP_OSS_ENDPOINT`
+- `MVP_OSS_PUBLIC_DOMAIN`
+- `MVP_OSS_ROOT_PREFIX`
+
+说明：Vercel 环境会自动把本地存储切到 `/tmp/photo2video-data`；长期素材与结果请使用 OSS。

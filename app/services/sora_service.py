@@ -5,10 +5,12 @@ import json
 import logging
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+from uuid import uuid4
 
 import httpx
 
 from app.config import Settings
+from app.services.oss_service import OssService
 from app.schemas import ClipVariant, ShotPlan, ShotReference
 from app.utils.ffmpeg_tools import make_image_clip
 
@@ -18,6 +20,7 @@ logger = logging.getLogger(__name__)
 class KieSoraService:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
+        self._oss = OssService(settings)
 
     async def generate_variants(
         self,
@@ -94,6 +97,39 @@ class KieSoraService:
                             local = self._render_dir(project_id) / f"{shot.shot_id}_v{variant_index + 1}.mp4"
                             downloaded = await self.download_video(video_url, local)
                             local_path = str(local) if downloaded else None
+                            if downloaded and self._oss.enabled:
+                                try:
+                                    object_key = self._oss.object_key(
+                                        "generated",
+                                        "videos",
+                                        project_id,
+                                        f"{shot.shot_id}_v{variant_index + 1}.mp4",
+                                    )
+                                    video_url = await self._oss.upload_file(
+                                        local_path=local,
+                                        object_key=object_key,
+                                        content_type="video/mp4",
+                                    )
+                                except Exception as exc:  # pragma: no cover - network instability
+                                    logger.warning("Persist video to OSS failed, keep temporary URL: %s", exc)
+                            elif self._oss.enabled:
+                                try:
+                                    object_key = self._oss.build_key_from_url(
+                                        video_url,
+                                        "generated",
+                                        "videos",
+                                        project_id,
+                                        shot.shot_id,
+                                        f"v{variant_index + 1}",
+                                        default_ext=".mp4",
+                                    )
+                                    video_url = await self._oss.mirror_from_url(
+                                        source_url=video_url,
+                                        object_key=object_key,
+                                        content_type="video/mp4",
+                                    )
+                                except Exception as exc:  # pragma: no cover - network instability
+                                    logger.warning("Mirror video URL to OSS failed, keep temporary URL: %s", exc)
                     except Exception as exc:  # pragma: no cover - network instability
                         logger.warning(
                             "KIE variant generation failed: shot=%s variant=%s error=%s",
@@ -169,6 +205,17 @@ class KieSoraService:
         return fallback_url
 
     async def upload_image(self, image_path: Path) -> str:
+        if self._oss.enabled:
+            try:
+                object_key = self._oss.object_key("inputs", image_path.parent.name, f"{uuid4().hex}_{image_path.name}")
+                return await self._oss.upload_file(
+                    local_path=image_path,
+                    object_key=object_key,
+                    content_type="application/octet-stream",
+                )
+            except Exception as exc:  # pragma: no cover - network instability
+                logger.warning("OSS source upload failed, fallback to kie upload: %s", exc)
+
         headers = {"Authorization": f"Bearer {self._settings.kie_api_key}"}
         candidates = [
             self._settings.kie_upload_base_url.rstrip("/"),

@@ -69,6 +69,7 @@ async def test_image_generation_updates_assets_incrementally(tmp_path: Path) -> 
         reference_image_service=_FakeReferenceImageService(),
         assembly_service=AssemblyService(settings),
         storage_root=tmp_path,
+        settings=settings,
     )
 
     image_path = tmp_path / "uploads" / "project-image.png"

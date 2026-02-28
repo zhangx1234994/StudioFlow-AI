@@ -112,6 +112,7 @@ async def test_render_progress_updates_during_generation(tmp_path: Path) -> None
         reference_image_service=ReferenceImageService(settings),
         assembly_service=AssemblyService(settings),
         storage_root=tmp_path,
+        settings=settings,
     )
 
     image_path = tmp_path / "uploads" / "project-render.png"
