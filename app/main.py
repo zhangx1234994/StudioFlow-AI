@@ -529,10 +529,13 @@ def serve_media_asset(asset_path: str) -> FileResponse:
 
 @app.get("/healthz")
 def healthcheck(settings: Settings = Depends(get_settings)) -> dict[str, str | bool]:
+    backend = _resolved_store_backend(settings)
     return {
         "status": "ok",
         "mock_mode": settings.use_mock_providers,
         "background_tasks": settings.allow_background_tasks,
+        "store_backend": backend,
+        "shared_store": backend in {"redis", "oss"},
     }
 
 
@@ -546,6 +549,17 @@ def _truthy(value: str | bool | None) -> bool:
     if value is None:
         return False
     return str(value).strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def _resolved_store_backend(settings: Settings) -> str:
+    backend = (settings.store_backend or "auto").strip().lower()
+    if backend == "auto":
+        if settings.redis_url:
+            return "redis"
+        if all([settings.oss_access_key, settings.oss_secret_key, settings.oss_bucket, settings.oss_endpoint]):
+            return "oss"
+        return "local"
+    return backend
 
 
 def _validate_duration_by_scenario(duration_sec: int, scenario_type: ScenarioType) -> None:
