@@ -274,6 +274,147 @@ class ReferenceImageService:
             )
         return refs
 
+    @property
+    def _coze_enabled(self) -> bool:
+        return bool(
+            not self._settings.use_mock_providers
+            and self._settings.coze_base_url
+            and self._settings.coze_api_token
+            and self._settings.coze_image_workflow_id
+        )
+
+    async def _run_coze_image_workflow(
+        self,
+        *,
+        image_input_urls: list[str],
+        prompt: str,
+        image_aspect_ratio: str | None = None,
+        image_resolution: str | None = None,
+    ) -> str | None:
+        if not self._coze_enabled:
+            return None
+        base_url = str(self._settings.coze_base_url or '').rstrip('/')
+        workflow_id = str(self._settings.coze_image_workflow_id or '').strip()
+        main_url = image_input_urls[0] if image_input_urls else ''
+        if not main_url:
+            raise RuntimeError('Coze image workflow requires main image URL')
+        reference_urls = image_input_urls[1:]
+        parameters: dict[str, Any] = {
+            'url': main_url,
+            'prompt': prompt,
+            'moxing': str(self._settings.coze_image_model_choice or '1'),
+        }
+        if reference_urls:
+            parameters['cankaotu'] = '\n'.join(reference_urls)
+        normalized_aspect = (image_aspect_ratio or '').strip()
+        if normalized_aspect and normalized_aspect not in {'', 'auto'}:
+            parameters['aspect_ratio'] = normalized_aspect
+        normalized_resolution = (image_resolution or '').strip()
+        if normalized_resolution:
+            parameters['resolution'] = normalized_resolution
+        headers = {
+            'Authorization': f'Bearer {self._settings.coze_api_token}',
+            'Content-Type': 'application/json',
+        }
+        service_token = str(self._settings.coze_service_api_token or '').strip()
+        if service_token:
+            headers['X-Podi-Service-Authorization'] = f'Bearer {service_token}'
+        payload = {'workflow_id': workflow_id, 'parameters': parameters}
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+            response = await client.post(f'{base_url}/v1/workflow/run', headers=headers, json=payload)
+            if response.status_code >= 400:
+                snippet = response.text[:240].replace('\n', ' ')
+                raise RuntimeError(f'coze workflow run failed ({response.status_code}): {snippet}')
+            data = response.json()
+        output = self._extract_coze_output(data)
+        if not output:
+            raise RuntimeError('coze workflow output is empty')
+        if self._looks_like_url(output):
+            return output
+        return await self._poll_coze_task_result(task_id=output)
+
+    async def _poll_coze_task_result(self, *, task_id: str) -> str | None:
+        base_url = str(self._settings.coze_base_url or '').rstrip('/')
+        headers = {'Authorization': f'Bearer {self._settings.coze_api_token}'}
+        service_token = str(self._settings.coze_service_api_token or '').strip()
+        if service_token:
+            headers['X-Podi-Service-Authorization'] = f'Bearer {service_token}'
+        poll_interval = max(1.0, float(self._settings.poll_interval_seconds))
+        timeout_seconds = max(20.0, float(self._settings.image_task_timeout_seconds))
+        max_attempts = max(1, int(timeout_seconds // poll_interval))
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+            for _ in range(max_attempts):
+                response = await client.get(f'{base_url}/api/coze/podi/tasks/get', headers=headers, params={'taskId': task_id})
+                if response.status_code >= 400:
+                    snippet = response.text[:240].replace('\n', ' ')
+                    raise RuntimeError(f'coze task get failed ({response.status_code}, task_id={task_id}): {snippet}')
+                data = response.json()
+                status = self._extract_coze_task_status(data)
+                if status == 'succeeded':
+                    images = self._extract_coze_images(data)
+                    return images[0] if images else None
+                if status == 'failed':
+                    raise RuntimeError(self._extract_coze_error_message(data) or 'coze task failed')
+                await asyncio.sleep(poll_interval)
+        raise RuntimeError(f'coze task timeout: {task_id}')
+
+    def _extract_coze_output(self, data: dict[str, Any]) -> str | None:
+        payload = data.get('data') if isinstance(data, dict) else None
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                return payload
+        if not isinstance(payload, dict):
+            return None
+        output = payload.get('output')
+        if isinstance(output, str) and output.strip():
+            return output.strip()
+        return None
+
+    def _extract_coze_task_status(self, data: dict[str, Any]) -> str:
+        payload = data.get('data') if isinstance(data, dict) else None
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                payload = {'taskStatus': payload}
+        if not isinstance(payload, dict):
+            return 'running'
+        status = str(payload.get('taskStatus') or payload.get('status') or '').strip().lower()
+        return status or 'running'
+
+    def _extract_coze_images(self, data: dict[str, Any]) -> list[str]:
+        payload = data.get('data') if isinstance(data, dict) else None
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                return []
+        if not isinstance(payload, dict):
+            return []
+        images = payload.get('images') or payload.get('output', {}).get('images') if isinstance(payload.get('output'), dict) else payload.get('images')
+        if isinstance(images, list):
+            return [str(item).strip() for item in images if str(item).strip()]
+        return []
+
+    def _extract_coze_error_message(self, data: dict[str, Any]) -> str:
+        payload = data.get('data') if isinstance(data, dict) else None
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                return str(payload)
+        if isinstance(payload, dict):
+            for key in ('errorMessage', 'error_message', 'debugResponse', 'message', 'detail'):
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        return ''
+
+    def _looks_like_url(self, value: str) -> bool:
+        return value.startswith('http://') or value.startswith('https://')
+
     async def _generate_single_storyboard_image(
         self,
         image_input_urls: list[str],
@@ -285,22 +426,29 @@ class ReferenceImageService:
         max_attempts = max(1, min(3, int(self._settings.image_task_retry_attempts or 2)))
         for attempt in range(1, max_attempts + 1):
             try:
-                task_id = await self._create_task(
-                    image_input_urls=image_input_urls,
-                    prompt=prompt,
-                    image_aspect_ratio=image_aspect_ratio,
-                    image_resolution=image_resolution,
-                    image_output_format=image_output_format,
-                )
-                image_url = await self._wait_task_result(task_id)
+                if self._coze_enabled:
+                    image_url = await self._run_coze_image_workflow(
+                        image_input_urls=image_input_urls,
+                        prompt=prompt,
+                        image_aspect_ratio=image_aspect_ratio,
+                        image_resolution=image_resolution,
+                    )
+                else:
+                    task_id = await self._create_task(
+                        image_input_urls=image_input_urls,
+                        prompt=prompt,
+                        image_aspect_ratio=image_aspect_ratio,
+                        image_resolution=image_resolution,
+                        image_output_format=image_output_format,
+                    )
+                    image_url = await self._wait_task_result(task_id)
                 if image_url:
                     return image_url
                 logger.warning(
                     "Storyboard image generation returned empty result "
-                    "(attempt=%s/%s, task_id=%s)",
+                    "(attempt=%s/%s)",
                     attempt,
                     max_attempts,
-                    task_id,
                 )
             except Exception as exc:  # pragma: no cover - network instability
                 logger.warning(

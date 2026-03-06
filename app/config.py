@@ -30,6 +30,12 @@ class Settings(BaseSettings):
     ref_image_base_url: str | None = None
     ref_image_model: str = "seedream"
 
+    coze_base_url: str | None = None
+    coze_api_token: str | None = None
+    coze_service_api_token: str | None = None
+    coze_image_workflow_id: str | None = None
+    coze_image_model_choice: str = "1"
+
     storage_root: Path = Path("data")
     store_backend: str = "auto"
     store_async_persist: bool = True
@@ -89,6 +95,10 @@ def get_settings() -> Settings:
     settings.supabase_service_role_key = (
         settings.supabase_service_role_key or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
     )
+    settings.coze_base_url = settings.coze_base_url or os.getenv("COZE_BASE_URL")
+    settings.coze_api_token = settings.coze_api_token or os.getenv("COZE_API_TOKEN")
+    settings.coze_service_api_token = settings.coze_service_api_token or os.getenv("SERVICE_API_TOKEN")
+    settings.coze_image_workflow_id = settings.coze_image_workflow_id or os.getenv("COZE_IMAGE_WORKFLOW_ID")
     settings.oss_access_key = settings.oss_access_key or os.getenv("OSS_ACCESS_KEY")
     settings.oss_secret_key = settings.oss_secret_key or os.getenv("OSS_SECRET_KEY")
     settings.oss_bucket = settings.oss_bucket or os.getenv("OSS_BUCKET")

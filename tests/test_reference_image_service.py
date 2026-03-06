@@ -196,3 +196,53 @@ def test_generate_images_from_prompts_supports_multi_reference_inputs(
         "https://public.example.com/ref-a.png",
         "https://cdn.example.com/ref.png",
     ]
+
+
+def test_generate_images_from_prompts_prefers_coze_workflow(monkeypatch, tmp_path: Path) -> None:
+    settings = Settings(
+        use_mock_providers=False,
+        storage_root=tmp_path,
+        coze_base_url="http://127.0.0.1:8888",
+        coze_api_token="token",
+        coze_image_workflow_id="workflow",
+    )
+    service = ReferenceImageService(settings)
+    main = tmp_path / "main.png"
+    main.write_bytes(b"main")
+
+    async def fake_upload(self, image_path: Path) -> str:
+        return f"https://cdn.example.com/{image_path.name}"
+
+    async def fake_coze(self, **kwargs) -> str | None:
+        assert kwargs["image_input_urls"][0] == "https://cdn.example.com/main.png"
+        return "https://img.example.com/out.png"
+
+    monkeypatch.setattr(ReferenceImageService, "_upload_image", fake_upload)
+    monkeypatch.setattr(ReferenceImageService, "_run_coze_image_workflow", fake_coze)
+
+    output = asyncio.run(
+        service.generate_images_from_prompts(
+            image_path=main,
+            image_public_url=None,
+            prompts=[PromptItem(shot_id="shot-1", prompt="测试提示词")],
+        )
+    )
+
+    assert output["shot-1"].source == "generated"
+    assert output["shot-1"].image_url == "https://img.example.com/out.png"
+
+
+def test_extract_coze_task_payload_parses_status_and_images(tmp_path: Path) -> None:
+    settings = Settings(storage_root=tmp_path)
+    service = ReferenceImageService(settings)
+    payload = {
+        "data": {
+            "taskStatus": "succeeded",
+            "images": ["https://img.example.com/a.png", "https://img.example.com/b.png"],
+        }
+    }
+    assert service._extract_coze_task_status(payload) == "succeeded"
+    assert service._extract_coze_images(payload) == [
+        "https://img.example.com/a.png",
+        "https://img.example.com/b.png",
+    ]
