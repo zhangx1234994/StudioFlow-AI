@@ -20,16 +20,15 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
 npm --prefix frontend install
-npm --prefix frontend run build
-python3 -m uvicorn app.main:app --host 0.0.0.0 --port 12222
+./scripts/dev_service.sh up
 ```
 
 登录：`admin / admin123`
 
 访问地址：
-- 工具箱首页: `http://127.0.0.1:12222/app/tools`
-- 素材库: `http://127.0.0.1:12222/app/assets`
-- 健康检查: `http://127.0.0.1:12222/healthz`
+- 工具箱首页: `http://127.0.0.1:5005/app/tools`
+- 素材库: `http://127.0.0.1:5005/app/assets`
+- 健康检查: `http://127.0.0.1:5005/healthz`
 
 ## Frontend Architecture
 
@@ -50,7 +49,8 @@ python3 -m uvicorn app.main:app --host 0.0.0.0 --port 12222
 
 关键变量：
 - `MVP_USE_MOCK_PROVIDERS=true`：本地 mock 模式（默认建议）
-- `MVP_VOLC_API_KEY`：火山 VL
+- `MVP_VOLC_API_KEY`：火山 VL（也兼容读取 `ARK_API_KEY`）
+- `MVP_VOLC_MODEL`：VL 模型名（默认 `doubao-seed-2-0-mini`）
 - `MVP_KIE_API_KEY`：KIE 图/视频接口
 - `MVP_AUTH_ENABLED=true`：启用登录态鉴权
 - `MVP_ALLOW_BACKGROUND_TASKS=true`：启用后台异步任务
@@ -62,6 +62,10 @@ python3 -m ruff check app tests
 python3 -m pytest -q
 npm --prefix frontend run build
 ```
+
+## Docs
+
+Start here: `docs/INDEX.md` — documentation hub, file map, and ownership.
 
 ## Vercel Notes
 
@@ -82,6 +86,7 @@ npm --prefix frontend run build
 - `MVP_ADMIN_PASSWORD`
 - `MVP_AUTH_SECRET`
 - `MVP_VOLC_API_KEY`
+- `MVP_VOLC_MODEL`（建议 `doubao-seed-2-0-mini`）
 - `MVP_KIE_API_KEY`
 - `MVP_OSS_ACCESS_KEY`
 - `MVP_OSS_SECRET_KEY`

@@ -91,52 +91,57 @@ def test_mvp_flow() -> None:
     assert create_resp.status_code == 200
 
     project = create_resp.json()["project"]
+    project_id = project["project_id"]
+    deadline = time.time() + 10
+    while time.time() < deadline and not project.get("script_options"):
+        time.sleep(0.5)
+        project = client.get(f"/api/v1/projects/{project_id}").json()
     assert len(project["script_options"]) == 3
     format_types = [item.get("format_type") for item in project["script_options"]]
     assert all(format_types)
     assert len(set(format_types)) >= 2
 
-    logs_resp = client.get(f"/api/v1/projects/{project['project_id']}/logs")
+    logs_resp = client.get(f"/api/v1/projects/{project_id}/logs")
     assert logs_resp.status_code == 200
     logs = logs_resp.json()
     assert any(item["stage"] == "create.start" for item in logs)
 
     select_resp = client.post(
-        f"/api/v1/projects/{project['project_id']}/select-script",
+        f"/api/v1/projects/{project_id}/select-script",
         json={"script_id": project["script_options"][0]["script_id"], "edits": []},
     )
     assert select_resp.status_code == 200
 
     derive_resp = client.post(
-        f"/api/v1/projects/{project['project_id']}/derive-prompts",
+        f"/api/v1/projects/{project_id}/derive-prompts",
         json={},
     )
     assert derive_resp.status_code == 200
 
     render_before_storyboard = client.post(
-        f"/api/v1/projects/{project['project_id']}/render",
+        f"/api/v1/projects/{project_id}/render",
         json={"variants_per_shot": 1, "preferred_variants": {}},
     )
     assert render_before_storyboard.status_code == 400
     assert "approve all storyboard shots" in render_before_storyboard.json()["detail"]
 
     storyboard_resp = client.post(
-        f"/api/v1/projects/{project['project_id']}/storyboard/generate",
+        f"/api/v1/projects/{project_id}/storyboard/generate",
         json={},
     )
     assert storyboard_resp.status_code == 200
     assert storyboard_resp.json()["storyboard_status"] in {"ready", "failed", "confirmed"}
 
-    project_after_storyboard = client.get(f"/api/v1/projects/{project['project_id']}").json()
+    project_after_storyboard = client.get(f"/api/v1/projects/{project_id}").json()
     for shot in project_after_storyboard["selected_script"]["shots"]:
         approve_resp = client.post(
-            f"/api/v1/projects/{project['project_id']}/storyboard/approve-shot",
+            f"/api/v1/projects/{project_id}/storyboard/approve-shot",
             json={"shot_id": shot["shot_id"], "status": "approved"},
         )
         assert approve_resp.status_code == 200
 
     regen_shot_resp = client.post(
-        f"/api/v1/projects/{project['project_id']}/storyboard/regenerate-shot",
+        f"/api/v1/projects/{project_id}/storyboard/regenerate-shot",
         json={"shot_id": "shot-1"},
     )
     assert regen_shot_resp.status_code == 200
@@ -256,6 +261,67 @@ def test_update_master_script_resets_status_after_render() -> None:
     assert updated_project["status"] == "scripted"
     assert updated_project["storyboard_status"] == "not_started"
     assert updated_project["render_id"] is None
+
+
+def test_update_plan_fills_missing_delivery_purpose() -> None:
+    client = TestClient(app)
+    create_resp = client.post(
+        "/api/v1/projects",
+        data={
+            "product_name": "用途补全测试",
+            "tool_type": "product_image_suite",
+        },
+        files={"image": ("demo.png", PNG_20X20, "image/png")},
+    )
+    assert create_resp.status_code == 200
+    project_id = create_resp.json()["project"]["project_id"]
+
+    plan_resp = client.post(
+        f"/api/v1/projects/{project_id}/plan",
+        json={"force": True, "async_mode": False},
+    )
+    assert plan_resp.status_code == 200
+    plan_project = plan_resp.json()
+    assert plan_project["project_plan"]["shots"]
+
+    plan_payload = plan_project["project_plan"]
+    plan_payload["shots"][0]["delivery_purpose"] = "   "
+    update_resp = client.patch(
+        f"/api/v1/projects/{project_id}/plan",
+        json={"project_plan": plan_payload},
+    )
+    assert update_resp.status_code == 200
+    updated = update_resp.json()
+    assert updated["project_plan"]["shots"][0]["delivery_purpose"] in {"主图", "场景图", "细节图", "对比图"}
+
+
+def test_product_image_plan_keeps_20_shots_complete() -> None:
+    client = TestClient(app)
+    create_resp = client.post(
+        "/api/v1/projects",
+        data={
+            "product_name": "20镜头完整性测试",
+            "tool_type": "product_image_suite",
+            "target_final_count": 20,
+            "takes_per_shot": 1,
+        },
+        files={"image": ("demo.png", PNG_20X20, "image/png")},
+    )
+    assert create_resp.status_code == 200
+    project_id = create_resp.json()["project"]["project_id"]
+
+    plan_resp = client.post(
+        f"/api/v1/projects/{project_id}/plan",
+        json={"force": True, "async_mode": False},
+    )
+    assert plan_resp.status_code == 200
+    payload = plan_resp.json()
+    plan = payload["project_plan"]
+    assert len(plan["shots"]) == 20
+    assert len({shot["shot_id"] for shot in plan["shots"]}) == 20
+    assert all(str(shot.get("image_prompt") or "").strip() for shot in plan["shots"])
+    assert payload["set_config"]["target_final_count"] == 20
+    assert payload["set_config"]["required_min_candidates"] == 20
 
 
 def test_mvp_async_flow() -> None:

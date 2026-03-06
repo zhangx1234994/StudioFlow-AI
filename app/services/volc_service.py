@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import re
 from typing import Any
 
@@ -509,6 +510,9 @@ class VolcScriptService:
         template_name: str,
         quality_level: QualityLevel = QualityLevel.standard,
         tool_type: ToolType | None = None,
+        expected_shot_count: int | None = None,
+        takes_per_shot: int | None = None,
+        target_candidate_assets: int | None = None,
         strict_json: bool = False,
     ) -> ProjectPlan:
         if self._settings.use_mock_providers or not self._settings.volc_api_key:
@@ -519,38 +523,82 @@ class VolcScriptService:
                 quality_level=quality_level,
             )
 
+        resolved_expected = self._resolve_expected_shot_count(
+            scenario_type=scenario_type,
+            expected_shot_count=expected_shot_count,
+        )
+        resolved_takes = max(1, min(4, int(takes_per_shot or 1)))
+        resolved_candidates = (
+            int(target_candidate_assets)
+            if isinstance(target_candidate_assets, int) and target_candidate_assets > 0
+            else max(1, resolved_expected) * resolved_takes
+        )
         try:
             image_data_url = self._to_data_url(image_bytes, image_mime)
-            raw_text = await asyncio.wait_for(
-                self._call_with_retry(
-                    self._build_planner_messages(
-                        image_data_url=image_data_url,
-                        brief=brief,
-                        scenario_type=scenario_type,
-                        template_name=template_name,
-                        quality_level=quality_level,
-                        tool_type=tool_type,
-                    )
-                ),
-                timeout=max(30.0, self._settings.vl_overall_timeout_seconds),
-            )
-            payload = await self._parse_json_or_repair(
-                raw_text=raw_text,
-                schema_name="project_plan",
-                schema_example=self._project_plan_schema_example(),
-            )
-            parsed = self._parse_project_plan(
-                payload=payload or {},
-                brief=brief,
+            if self._should_use_outline_strategy(
                 scenario_type=scenario_type,
-                template_name=template_name,
-                quality_level=quality_level,
-            )
+                expected_shot_count=resolved_expected,
+            ):
+                parsed = await self._generate_project_plan_outline_first(
+                    image_data_url=image_data_url,
+                    brief=brief,
+                    scenario_type=scenario_type,
+                    template_name=template_name,
+                    quality_level=quality_level,
+                    tool_type=tool_type,
+                    expected_shot_count=resolved_expected,
+                    takes_per_shot=resolved_takes,
+                    target_candidate_assets=resolved_candidates,
+                )
+            else:
+                raw_text = await asyncio.wait_for(
+                    self._call_with_retry(
+                        self._build_planner_messages(
+                            image_data_url=image_data_url,
+                            brief=brief,
+                            scenario_type=scenario_type,
+                            template_name=template_name,
+                            quality_level=quality_level,
+                            tool_type=tool_type,
+                            expected_shot_count=resolved_expected,
+                            takes_per_shot=resolved_takes,
+                            target_candidate_assets=resolved_candidates,
+                        )
+                    ),
+                    timeout=min(60.0, max(30.0, self._settings.vl_overall_timeout_seconds)),
+                )
+                payload = await self._parse_json_or_repair(
+                    raw_text=raw_text,
+                    schema_name="project_plan",
+                    schema_example=self._project_plan_schema_example(),
+                )
+                parsed = self._parse_project_plan(
+                    payload=payload or {},
+                    brief=brief,
+                    scenario_type=scenario_type,
+                    template_name=template_name,
+                    quality_level=quality_level,
+                )
+
+            if resolved_expected > 0 and len(parsed.shots) < resolved_expected:
+                expanded_shots = await self._expand_missing_plan_shots(
+                    image_data_url=image_data_url,
+                    brief=brief,
+                    scenario_type=scenario_type,
+                    existing_shots=list(parsed.shots),
+                    expected_shot_count=resolved_expected,
+                )
+                parsed = parsed.model_copy(update={"shots": expanded_shots})
             notes = [item for item in parsed.planner_notes if item]
             if not any(item.startswith("source:") for item in notes):
                 notes.insert(0, "source:volc")
             if not any(item.startswith("planner_prompt_version:") for item in notes):
                 notes.insert(1, f"planner_prompt_version:{self._PLANNER_PROMPT_VERSION}")
+            if resolved_expected > 0:
+                notes.append(f"expected_shot_count:{resolved_expected}")
+            if resolved_takes > 0:
+                notes.append(f"takes_per_shot:{resolved_takes}")
+            notes.append(f"target_candidate_assets:{resolved_candidates}")
             return parsed.model_copy(update={"planner_notes": notes[:8]})
         except Exception as exc:
             if strict_json:
@@ -580,13 +628,31 @@ class VolcScriptService:
             scenario_type=plan.scenario_type,
         )
         image_pack = [
-            PromptItem(shot_id=shot.shot_id, prompt=self._cleanup_prompt_text(shot.image_prompt))
+            PromptItem(
+                shot_id=shot.shot_id,
+                prompt=self._compile_image_generation_prompt(
+                    shot=shot,
+                    scenario_type=plan.scenario_type,
+                    product_name=brief.product_name,
+                    quality_level=quality_level,
+                ),
+            )
             for shot in normalized_shots
         ]
         video_pack = [
-            PromptItem(shot_id=shot.shot_id, prompt=self._sanitize_video_prompt(shot.video_prompt))
+            PromptItem(
+                shot_id=shot.shot_id,
+                prompt=self._compile_video_generation_prompt(
+                    shot=shot,
+                    scenario_type=plan.scenario_type,
+                    product_name=brief.product_name,
+                    quality_level=quality_level,
+                ),
+            )
             for shot in normalized_shots
         ]
+        image_quality_scores = [self._prompt_quality_score(item.prompt, mode="image") for item in image_pack]
+        video_quality_scores = [self._prompt_quality_score(item.prompt, mode="video") for item in video_pack]
         planner_source = next(
             (item for item in plan.planner_notes if isinstance(item, str) and item.startswith("source:")),
             "source:unknown",
@@ -612,6 +678,8 @@ class VolcScriptService:
             "planner_prompt_version": planner_prompt_version,
             "tool_type": (tool_type.value if tool_type else "unknown"),
             "template_name": plan.template_name,
+            "image_prompt_quality_avg": round(sum(image_quality_scores) / max(1, len(image_quality_scores)), 3),
+            "video_prompt_quality_avg": round(sum(video_quality_scores) / max(1, len(video_quality_scores)), 3),
         }
         return PromptPack(
             planner_prompt=planner_prompt,
@@ -671,8 +739,9 @@ class VolcScriptService:
             shots=[
                 {
                     "shot_id": shot.shot_id,
-                    "prompt": self._cleanup_prompt_text(
-                        shot.reference_image_prompt or shot.visual_prompt
+                    "prompt": self._compile_script_image_prompt(
+                        shot=shot,
+                        product_name=brief.product_name,
                     ),
                 }
                 for shot in refined.shots
@@ -683,7 +752,10 @@ class VolcScriptService:
             shots=[
                 {
                     "shot_id": shot.shot_id,
-                    "prompt": self._sanitize_video_prompt(shot.visual_prompt),
+                    "prompt": self._compile_script_video_prompt(
+                        shot=shot,
+                        product_name=brief.product_name,
+                    ),
                 }
                 for shot in refined.shots
             ],
@@ -771,34 +843,90 @@ class VolcScriptService:
             "Authorization": f"Bearer {self._settings.volc_api_key}",
             "Content-Type": "application/json",
         }
-        body: dict[str, Any] = {
-            "model": self._settings.volc_model,
-            "input": messages,
-            "max_output_tokens": 3000,
-        }
-
+        request_descriptor = json.dumps(messages, ensure_ascii=False)
+        max_output_tokens = 3000
+        if "project_plan_single_shot" in request_descriptor:
+            max_output_tokens = 900
+        elif "project_plan_outline" in request_descriptor:
+            max_output_tokens = 1200
+        model_candidates = self._resolve_volc_model_candidates()
         request_timeout = min(180.0, max(70.0, self._settings.vl_overall_timeout_seconds + 20.0))
+        last_http_error: httpx.HTTPStatusError | None = None
         async with httpx.AsyncClient(timeout=request_timeout) as client:
-            response = await client.post(self._settings.volc_base_url, headers=headers, json=body)
-            response.raise_for_status()
-            data = response.json()
+            for model_name in model_candidates:
+                body: dict[str, Any] = {
+                    "model": model_name,
+                    "input": messages,
+                    "max_output_tokens": max_output_tokens,
+                }
+                if self._settings.volc_disable_thinking:
+                    body["thinking"] = {"type": "disabled"}
+                response = await client.post(self._settings.volc_base_url, headers=headers, json=body)
+                if response.status_code >= 400:
+                    if self._can_retry_with_fallback_model(response=response):
+                        try:
+                            response.raise_for_status()
+                        except httpx.HTTPStatusError as exc:
+                            last_http_error = exc
+                            continue
+                    response.raise_for_status()
+                data = response.json()
+                if isinstance(data.get("output_text"), str):
+                    return data["output_text"]
 
-        if isinstance(data.get("output_text"), str):
-            return data["output_text"]
+                output = data.get("output", [])
+                text_chunks: list[str] = []
+                if isinstance(output, list):
+                    for item in output:
+                        content = item.get("content", []) if isinstance(item, dict) else []
+                        if not isinstance(content, list):
+                            continue
+                        for chunk in content:
+                            if not isinstance(chunk, dict):
+                                continue
+                            if isinstance(chunk.get("text"), str):
+                                text_chunks.append(chunk["text"])
+                return "\n".join(text_chunks)
 
-        output = data.get("output", [])
-        text_chunks: list[str] = []
-        if isinstance(output, list):
-            for item in output:
-                content = item.get("content", []) if isinstance(item, dict) else []
-                if not isinstance(content, list):
-                    continue
-                for chunk in content:
-                    if not isinstance(chunk, dict):
-                        continue
-                    if isinstance(chunk.get("text"), str):
-                        text_chunks.append(chunk["text"])
-        return "\n".join(text_chunks)
+        if last_http_error:
+            raise last_http_error
+        raise RuntimeError("volc response request failed without valid response")
+
+    def _resolve_volc_model_candidates(self) -> list[str]:
+        primary = (self._settings.volc_model or "").strip()
+        fallback_env = (os.getenv("ARK_FALLBACK_MODEL") or "").strip()
+        candidates = [
+            primary,
+            fallback_env,
+            "doubao-seed-2-0-pro-260215",
+            "doubao-seed-1-6-251015",
+        ]
+        dedup: list[str] = []
+        for item in candidates:
+            if item and item not in dedup:
+                dedup.append(item)
+        return dedup or ["doubao-seed-1-6-251015"]
+
+    def _can_retry_with_fallback_model(self, *, response: httpx.Response) -> bool:
+        if response.status_code != 404:
+            return False
+        code = ""
+        message = ""
+        try:
+            payload = response.json()
+            err = payload.get("error", {}) if isinstance(payload, dict) else {}
+            code = str(err.get("code") or "")
+            message = str(err.get("message") or "")
+        except Exception:
+            message = response.text or ""
+        code_lower = code.lower()
+        message_lower = message.lower()
+        return (
+            "invalidendpointormodel.notfound" in code_lower
+            or "model or endpoint" in message_lower
+            or "does not exist" in message_lower
+            or "do not have access" in message_lower
+        )
 
     def _build_analysis_messages(
         self,
@@ -842,6 +970,453 @@ class VolcScriptService:
             },
         ]
 
+    def _resolve_expected_shot_count(
+        self,
+        *,
+        scenario_type: ScenarioType,
+        expected_shot_count: int | None,
+    ) -> int:
+        if isinstance(expected_shot_count, int) and expected_shot_count > 0:
+            return max(1, min(30, expected_shot_count))
+        defaults = {
+            ScenarioType.product_image_suite: 4,
+            ScenarioType.model_retouch: 4,
+            ScenarioType.multi_angle_camera: 4,
+            ScenarioType.product_video: 4,
+        }
+        return defaults.get(scenario_type, 4)
+
+    def _should_use_outline_strategy(
+        self,
+        *,
+        scenario_type: ScenarioType,
+        expected_shot_count: int,
+    ) -> bool:
+        if expected_shot_count <= 0:
+            return False
+        if scenario_type in {ScenarioType.product_image_suite, ScenarioType.model_retouch}:
+            return expected_shot_count >= 7
+        return expected_shot_count >= 8
+
+    async def _generate_project_plan_outline_first(
+        self,
+        *,
+        image_data_url: str,
+        brief: ProductBrief,
+        scenario_type: ScenarioType,
+        template_name: str,
+        quality_level: QualityLevel,
+        tool_type: ToolType | None,
+        expected_shot_count: int,
+        takes_per_shot: int,
+        target_candidate_assets: int,
+    ) -> ProjectPlan:
+        outline_raw = await asyncio.wait_for(
+            self._call_with_retry(
+                self._build_plan_outline_messages(
+                    image_data_url=image_data_url,
+                    brief=brief,
+                    scenario_type=scenario_type,
+                    template_name=template_name,
+                    quality_level=quality_level,
+                    tool_type=tool_type,
+                    expected_shot_count=expected_shot_count,
+                    takes_per_shot=takes_per_shot,
+                    target_candidate_assets=target_candidate_assets,
+                )
+            ),
+            timeout=max(20.0, min(45.0, self._settings.vl_overall_timeout_seconds)),
+        )
+        outline_payload = await self._parse_json_or_repair(
+            raw_text=outline_raw,
+            schema_name="project_plan_outline",
+            schema_example=self._plan_outline_schema_example(),
+        )
+        outline_summary = (
+            str((outline_payload or {}).get("summary") or "").strip()
+            or f"{brief.product_name}执行方案（outline）"
+        )
+        outline_notes = [
+            str(item).strip()
+            for item in (outline_payload or {}).get("planner_notes", [])
+            if str(item).strip()
+        ][:6]
+        outline_shots_raw = (outline_payload or {}).get("shots", [])
+        outline_shots: list[dict[str, Any]] = []
+        if isinstance(outline_shots_raw, list):
+            for idx, item in enumerate(outline_shots_raw, start=1):
+                if isinstance(item, dict):
+                    outline_shots.append(dict(item))
+                if len(outline_shots) >= expected_shot_count:
+                    break
+        while len(outline_shots) < expected_shot_count:
+            outline_shots.append(
+                self._build_outline_fallback_entry(
+                    scenario_type=scenario_type,
+                    shot_index=len(outline_shots) + 1,
+                )
+            )
+
+        parallelism = min(8, max(2, self._settings.storyboard_concurrency))
+        semaphore = asyncio.Semaphore(parallelism)
+
+        async def _render_one(index: int, outline_entry: dict[str, Any]) -> PlanShot:
+            async with semaphore:
+                try:
+                    raw_shot = await asyncio.wait_for(
+                        self._generate_single_plan_shot_payload(
+                            image_data_url=image_data_url,
+                            brief=brief,
+                            scenario_type=scenario_type,
+                            template_name=template_name,
+                            quality_level=quality_level,
+                            tool_type=tool_type,
+                            shot_index=index,
+                            outline_entry=outline_entry,
+                        ),
+                        timeout=max(15.0, min(35.0, self._settings.vl_overall_timeout_seconds)),
+                    )
+                    return self._parse_plan_shot(
+                        raw_shot=raw_shot,
+                        shot_index=index,
+                        brief=brief,
+                        scenario_type=scenario_type,
+                    )
+                except Exception:
+                    return self._build_fallback_plan_shot(
+                        brief=brief,
+                        scenario_type=scenario_type,
+                        shot_index=index,
+                        outline_entry=outline_entry,
+                    )
+
+        tasks = [
+            _render_one(idx, outline_shots[idx - 1])
+            for idx in range(1, expected_shot_count + 1)
+        ]
+        generated_shots = list(await asyncio.gather(*tasks))
+        generated_shots = self._ensure_plan_prompt_diversity(
+            shots=generated_shots,
+            product_name=brief.product_name,
+            scenario_type=scenario_type,
+        )
+        generated_shots = self._apply_creative_direction_to_shots(
+            shots=generated_shots,
+            creative_direction=brief.creative_direction,
+            scenario_type=scenario_type,
+        )
+        return ProjectPlan(
+            scenario_type=scenario_type,
+            template_name=template_name,
+            channels=brief.channels,
+            summary=outline_summary,
+            planner_notes=[*outline_notes, "planner_strategy:outline_parallel_fill"][:8],
+            shots=generated_shots[:expected_shot_count],
+        )
+
+    async def _expand_missing_plan_shots(
+        self,
+        *,
+        image_data_url: str,
+        brief: ProductBrief,
+        scenario_type: ScenarioType,
+        existing_shots: list[PlanShot],
+        expected_shot_count: int,
+    ) -> list[PlanShot]:
+        merged = list(existing_shots[:expected_shot_count])
+        if expected_shot_count <= 0 or len(merged) >= expected_shot_count:
+            return merged
+
+        parallelism = min(6, max(2, self._settings.storyboard_concurrency))
+        semaphore = asyncio.Semaphore(parallelism)
+
+        async def _fill_one(shot_index: int) -> PlanShot:
+            outline_entry = self._build_outline_fallback_entry(
+                scenario_type=scenario_type,
+                shot_index=shot_index,
+            )
+            async with semaphore:
+                try:
+                    raw_shot = await asyncio.wait_for(
+                        self._generate_single_plan_shot_payload(
+                            image_data_url=image_data_url,
+                            brief=brief,
+                            scenario_type=scenario_type,
+                            template_name="general",
+                            quality_level=QualityLevel.standard,
+                            tool_type=None,
+                            shot_index=shot_index,
+                            outline_entry=outline_entry,
+                        ),
+                        timeout=max(12.0, min(28.0, self._settings.vl_overall_timeout_seconds)),
+                    )
+                    return self._parse_plan_shot(
+                        raw_shot=raw_shot,
+                        shot_index=shot_index,
+                        brief=brief,
+                        scenario_type=scenario_type,
+                    )
+                except Exception:
+                    return self._build_fallback_plan_shot(
+                        brief=brief,
+                        scenario_type=scenario_type,
+                        shot_index=shot_index,
+                        outline_entry=outline_entry,
+                    )
+
+        start_index = len(merged) + 1
+        tasks = [_fill_one(idx) for idx in range(start_index, expected_shot_count + 1)]
+        if tasks:
+            merged.extend(await asyncio.gather(*tasks))
+        merged = self._ensure_plan_prompt_diversity(
+            shots=merged,
+            product_name=brief.product_name,
+            scenario_type=scenario_type,
+        )
+        merged = self._apply_creative_direction_to_shots(
+            shots=merged,
+            creative_direction=brief.creative_direction,
+            scenario_type=scenario_type,
+        )
+        return merged[:expected_shot_count]
+
+    async def _generate_single_plan_shot_payload(
+        self,
+        *,
+        image_data_url: str,
+        brief: ProductBrief,
+        scenario_type: ScenarioType,
+        template_name: str,
+        quality_level: QualityLevel,
+        tool_type: ToolType | None,
+        shot_index: int,
+        outline_entry: dict[str, Any],
+    ) -> dict[str, Any]:
+        raw_text = await self._call_with_retry(
+            self._build_single_shot_messages(
+                image_data_url=image_data_url,
+                brief=brief,
+                scenario_type=scenario_type,
+                template_name=template_name,
+                quality_level=quality_level,
+                tool_type=tool_type,
+                shot_index=shot_index,
+                outline_entry=outline_entry,
+            )
+        )
+        payload = await self._parse_json_or_repair(
+            raw_text=raw_text,
+            schema_name="project_plan_single_shot",
+            schema_example=self._single_shot_schema_example(),
+        )
+        if isinstance(payload, dict) and isinstance(payload.get("shot"), dict):
+            return dict(payload["shot"])
+        if isinstance(payload, dict):
+            return dict(payload)
+        raise ValueError("single shot payload is invalid")
+
+    def _build_outline_fallback_entry(
+        self,
+        *,
+        scenario_type: ScenarioType,
+        shot_index: int,
+    ) -> dict[str, Any]:
+        stage = self._stage_for_shot_index(shot_index)
+        return {
+            "shot_id": f"shot-{shot_index}",
+            "title": f"镜头{shot_index}",
+            "intent": "补充卖点表达",
+            "stage": stage.value,
+            "duration_sec": 4,
+            "delivery_purpose": self._default_delivery_purpose(
+                scenario_type=scenario_type,
+                stage=stage,
+            ),
+        }
+
+    def _build_fallback_plan_shot(
+        self,
+        *,
+        brief: ProductBrief,
+        scenario_type: ScenarioType,
+        shot_index: int,
+        outline_entry: dict[str, Any],
+    ) -> PlanShot:
+        stage_name = str(outline_entry.get("stage") or self._stage_for_shot_index(shot_index).value)
+        stage_value = stage_name if stage_name in ShotStage._value2member_map_ else ShotStage.feature.value
+        stage = ShotStage(stage_value)
+        title = str(outline_entry.get("title") or f"镜头{shot_index}")
+        intent = str(outline_entry.get("intent") or "补充卖点表达")
+        image_prompt = self._compose_image_prompt(
+            product_name=brief.product_name,
+            scenario_type=scenario_type,
+            stage=stage.value,
+            shot_index=shot_index,
+            title=title,
+            intent=intent,
+            base_prompt=f"{brief.product_name}，{title}，突出{intent}",
+        )
+        video_prompt = self._sanitize_video_prompt(
+            f"{brief.product_name}，{title}，{intent}，动作自然，镜头路径清晰。"
+        )
+        return PlanShot(
+            shot_id=str(outline_entry.get("shot_id") or f"shot-{shot_index}"),
+            title=title,
+            intent=intent,
+            duration_sec=max(3, min(8, int(outline_entry.get("duration_sec") or 4))),
+            stage=stage,
+            image_prompt=image_prompt,
+            video_prompt=video_prompt,
+            delivery_purpose=str(outline_entry.get("delivery_purpose") or "").strip()
+            or self._default_delivery_purpose(scenario_type=scenario_type, stage=stage),
+            retouch_prompt=(
+                f"{brief.product_name}，{title}，轻度精修，保持身份与构图稳定。"
+                if scenario_type == ScenarioType.model_retouch
+                else ""
+            ),
+            retouch_goal=(
+                f"{title}：轻度保真精修，保持原图动作和背景"
+                if scenario_type == ScenarioType.model_retouch
+                else None
+            ),
+            identity_lock_rules=(
+                ["保持五官结构和骨相一致", "保持服装版型与动作骨架一致"]
+                if scenario_type == ScenarioType.model_retouch
+                else []
+            ),
+            local_edit_instructions=(
+                ["先修动作连贯性，再修肤色和光线", "保持背景与构图不重构"]
+                if scenario_type == ScenarioType.model_retouch
+                else []
+            ),
+            negative_constraints=(
+                ["禁止背景重构", "禁止半身替代全身", "禁止新增肢体"]
+                if scenario_type == ScenarioType.model_retouch
+                else []
+            ),
+        )
+
+    def _build_plan_outline_messages(
+        self,
+        *,
+        image_data_url: str,
+        brief: ProductBrief,
+        scenario_type: ScenarioType,
+        template_name: str,
+        quality_level: QualityLevel,
+        tool_type: ToolType | None,
+        expected_shot_count: int,
+        takes_per_shot: int,
+        target_candidate_assets: int,
+    ) -> list[dict[str, Any]]:
+        resolved_tool = tool_type or ToolType.intro_video_multi_script
+        prompt_header = self._planner_system_prompt(tool_type=tool_type, scenario_type=scenario_type)
+        system_prompt = (
+            f"{prompt_header}"
+            "你是分镜大纲规划器。"
+            "先输出shot大纲，禁止长篇说明，禁止思考过程。"
+            "只返回JSON。"
+        )
+        payload = {
+            "task": "输出分镜大纲",
+            "response_style": "fast_outline_json_only",
+            "scenario_type": scenario_type.value,
+            "tool_type": resolved_tool.value,
+            "template_name": template_name,
+            "quality_level": quality_level.value,
+            "execution_hints": {
+                "expected_shot_count": expected_shot_count,
+                "takes_per_shot": takes_per_shot,
+                "target_candidate_assets": target_candidate_assets,
+                "latency_mode": "fast",
+            },
+            "brief": {
+                "product_name": brief.product_name,
+                "target_audience": brief.target_audience,
+                "platform": brief.platform,
+                "key_features": brief.key_features,
+                "creative_direction": brief.creative_direction,
+            },
+            "hard_rules": [
+                f"shots总数必须等于{expected_shot_count}",
+                "每个shot必须包含shot_id/title/intent/stage/delivery_purpose/duration_sec",
+                "只输出分镜大纲，不输出image_prompt/video_prompt",
+                "按shot_id升序输出，不允许缺号",
+            ],
+            "output_schema": self._plan_outline_schema_example(),
+        }
+        return [
+            {
+                "role": "system",
+                "content": [{"type": "input_text", "text": system_prompt}],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "image_url": image_data_url},
+                    {"type": "input_text", "text": json.dumps(payload, ensure_ascii=False)},
+                ],
+            },
+        ]
+
+    def _build_single_shot_messages(
+        self,
+        *,
+        image_data_url: str,
+        brief: ProductBrief,
+        scenario_type: ScenarioType,
+        template_name: str,
+        quality_level: QualityLevel,
+        tool_type: ToolType | None,
+        shot_index: int,
+        outline_entry: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        resolved_tool = tool_type or ToolType.intro_video_multi_script
+        prompt_header = self._planner_system_prompt(tool_type=tool_type, scenario_type=scenario_type)
+        system_prompt = (
+            f"{prompt_header}"
+            "你是单镜头分镜生成器。"
+            "仅生成一个shot，速度优先，不要思考过程。"
+            "只返回JSON。"
+        )
+        payload = {
+            "task": "补全单镜头提示词",
+            "response_style": "fast_single_shot_json_only",
+            "scenario_type": scenario_type.value,
+            "tool_type": resolved_tool.value,
+            "template_name": template_name,
+            "quality_level": quality_level.value,
+            "shot_index": shot_index,
+            "outline_shot": outline_entry,
+            "brief": {
+                "product_name": brief.product_name,
+                "target_audience": brief.target_audience,
+                "platform": brief.platform,
+                "key_features": brief.key_features,
+                "creative_direction": brief.creative_direction,
+            },
+            "hard_rules": [
+                "只输出一个shot对象",
+                "image_prompt必须可执行且和其他镜头明显不同",
+                "video_prompt禁止字幕/文字/logo/水印/UI",
+                "提示词写结果，不写解释",
+            ],
+            "output_schema": self._single_shot_schema_example(),
+        }
+        return [
+            {
+                "role": "system",
+                "content": [{"type": "input_text", "text": system_prompt}],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "image_url": image_data_url},
+                    {"type": "input_text", "text": json.dumps(payload, ensure_ascii=False)},
+                ],
+            },
+        ]
+
     def _build_planner_messages(
         self,
         image_data_url: str,
@@ -850,23 +1425,44 @@ class VolcScriptService:
         template_name: str,
         quality_level: QualityLevel,
         tool_type: ToolType | None = None,
+        expected_shot_count: int | None = None,
+        takes_per_shot: int | None = None,
+        target_candidate_assets: int | None = None,
     ) -> list[dict[str, Any]]:
         resolved_tool = tool_type or ToolType.intro_video_multi_script
         template_spec = self._resolve_template_spec(
             tool_type=resolved_tool,
             template_name=template_name,
         )
+        resolved_expected = self._resolve_expected_shot_count(
+            scenario_type=scenario_type,
+            expected_shot_count=expected_shot_count,
+        )
+        resolved_takes = max(1, min(4, int(takes_per_shot or 1)))
+        resolved_candidates = (
+            int(target_candidate_assets)
+            if isinstance(target_candidate_assets, int) and target_candidate_assets > 0
+            else max(1, resolved_expected) * resolved_takes
+        )
         prompt_header = self._planner_system_prompt(tool_type=tool_type, scenario_type=scenario_type)
         system_prompt = (
             f"{prompt_header}"
             "你只输出严格JSON，不能输出解释。"
             "你需要把创意拆成可执行分镜，兼容生图和生视频。"
+            "速度优先：禁止输出思考过程，不要长篇分析，只返回结果JSON。"
         )
         payload = {
             "task": "生成跨模型执行计划",
+            "response_style": "fast_direct_json_only",
             "scenario_type": scenario_type.value,
             "tool_type": resolved_tool.value,
             "template_name": template_name,
+            "execution_hints": {
+                "expected_shot_count": resolved_expected,
+                "takes_per_shot": resolved_takes,
+                "target_candidate_assets": resolved_candidates,
+                "latency_mode": "fast",
+            },
             "template_pack": {
                 "display_name": template_spec.get("display_name", template_name),
                 "description": template_spec.get("description", ""),
@@ -888,14 +1484,18 @@ class VolcScriptService:
             "hard_rules": [
                 "必须输出shots数组，按shot_id升序",
                 "每个shot同时提供image_prompt和video_prompt",
+                "每个shot必须提供delivery_purpose，不能为空字符串",
                 "video_prompt禁止要求字幕、文字、logo、水印",
                 "动作和镜头语言明确，避免元话术",
                 "场景A/B至少4个shot，场景C至少3个shot",
+                f"shots总数必须等于{resolved_expected}",
+                f"按每镜头试拍{resolved_takes}张估算候选产物，总候选目标约{resolved_candidates}",
                 "不同shot的image_prompt/video_prompt必须明显不同，不允许仅换序号",
                 "image_prompt必须包含: 主体对象 + 景别/机位 + 构图 + 光线 + 材质/色彩，不得空泛",
                 "所有输出遵守合规，不使用绝对化词汇",
                 "template_pack.planner_focus中的要求优先级最高，必须落到具体分镜",
                 "若brief.creative_direction非空，必须将其落为可执行镜头与提示词，不得忽略",
+                "当tool_type=product_image_suite时，delivery_purpose只能使用：主图/场景图/细节图/对比图",
             ],
             "scenario_focus": self._scenario_focus_rules(scenario_type),
             "creative_rules": self._creative_direction_rules(brief.creative_direction),
@@ -945,7 +1545,7 @@ class VolcScriptService:
             )
         if tool_type == ToolType.multi_angle_camera:
             return (
-                "你是AI摄影棚的多角度拍摄导演，擅长用相机参数规划产品多角度图组。"
+                "你是AI摄影棚的多角度拍摄导演，擅长在不改变原对象本体的前提下，用相机参数规划同一对象的多角度视图。"
             )
         if scenario_type == ScenarioType.product_video:
             return "你是电商视觉总监与导演。"
@@ -1154,6 +1754,7 @@ class VolcScriptService:
                     "intent": "string",
                     "duration_sec": 5,
                     "stage": "hook|feature|proof|cta",
+                    "delivery_purpose": "主图|场景图|细节图|对比图",
                     "image_prompt": "string",
                     "video_prompt": "string",
                     "retouch_prompt": "string",
@@ -1163,6 +1764,41 @@ class VolcScriptService:
                     "negative_constraints": ["string"],
                 }
             ],
+        }
+
+    def _plan_outline_schema_example(self) -> dict[str, Any]:
+        return {
+            "summary": "string",
+            "planner_notes": ["string"],
+            "shots": [
+                {
+                    "shot_id": "shot-1",
+                    "title": "string",
+                    "intent": "string",
+                    "stage": "hook|feature|proof|cta",
+                    "delivery_purpose": "主图|场景图|细节图|对比图",
+                    "duration_sec": 4,
+                }
+            ],
+        }
+
+    def _single_shot_schema_example(self) -> dict[str, Any]:
+        return {
+            "shot": {
+                "shot_id": "shot-1",
+                "title": "string",
+                "intent": "string",
+                "duration_sec": 4,
+                "stage": "hook|feature|proof|cta",
+                "delivery_purpose": "主图|场景图|细节图|对比图",
+                "image_prompt": "string",
+                "video_prompt": "string",
+                "retouch_prompt": "string",
+                "retouch_goal": "string",
+                "identity_lock_rules": ["string"],
+                "local_edit_instructions": ["string"],
+                "negative_constraints": ["string"],
+            }
         }
 
     def _parse_project_plan(
@@ -1176,50 +1812,14 @@ class VolcScriptService:
         raw_shots = payload.get("shots", []) if isinstance(payload, dict) else []
         shots: list[PlanShot] = []
         for idx, raw_shot in enumerate(raw_shots):
-            if not isinstance(raw_shot, dict):
-                continue
-            stage_name = str(raw_shot.get("stage") or "feature")
-            stage_value = stage_name if stage_name in ShotStage._value2member_map_ else ShotStage.feature.value
-            try:
-                duration = int(raw_shot.get("duration_sec") or (5 if scenario_type == ScenarioType.product_video else 4))
-            except (TypeError, ValueError):
-                duration = 5
-            duration = max(3, min(8, duration))
-            shot_id = str(raw_shot.get("shot_id") or f"shot-{idx + 1}")
-            image_prompt = self._cleanup_prompt_text(str(raw_shot.get("image_prompt") or ""))
-            video_prompt = self._sanitize_video_prompt(str(raw_shot.get("video_prompt") or image_prompt))
-            if not image_prompt:
-                image_prompt = self._default_image_prompt(brief.product_name, stage_value)
-            if not video_prompt:
-                video_prompt = self._sanitize_video_prompt(image_prompt)
-            shots.append(
-                PlanShot(
-                    shot_id=shot_id,
-                    title=str(raw_shot.get("title") or f"镜头{idx + 1}"),
-                    intent=str(raw_shot.get("intent") or "强化核心卖点"),
-                    duration_sec=duration,
-                    stage=ShotStage(stage_value),
-                    image_prompt=image_prompt,
-                    video_prompt=video_prompt,
-                    retouch_prompt=str(raw_shot.get("retouch_prompt") or ""),
-                    retouch_goal=str(raw_shot.get("retouch_goal") or "").strip() or None,
-                    identity_lock_rules=[
-                        str(item).strip()
-                        for item in raw_shot.get("identity_lock_rules", [])
-                        if str(item).strip()
-                    ][:6],
-                    local_edit_instructions=[
-                        str(item).strip()
-                        for item in raw_shot.get("local_edit_instructions", [])
-                        if str(item).strip()
-                    ][:8],
-                    negative_constraints=[
-                        str(item).strip()
-                        for item in raw_shot.get("negative_constraints", [])
-                        if str(item).strip()
-                    ][:8],
-                )
+            parsed_shot = self._parse_plan_shot(
+                raw_shot=raw_shot,
+                shot_index=idx + 1,
+                brief=brief,
+                scenario_type=scenario_type,
             )
+            if parsed_shot:
+                shots.append(parsed_shot)
         shots = self._ensure_plan_prompt_diversity(
             shots=shots,
             product_name=brief.product_name,
@@ -1247,6 +1847,77 @@ class VolcScriptService:
             shots=shots,
         )
 
+    def _parse_plan_shot(
+        self,
+        *,
+        raw_shot: Any,
+        shot_index: int,
+        brief: ProductBrief,
+        scenario_type: ScenarioType,
+    ) -> PlanShot | None:
+        if not isinstance(raw_shot, dict):
+            return None
+        stage_name = str(raw_shot.get("stage") or "feature")
+        stage_value = stage_name if stage_name in ShotStage._value2member_map_ else ShotStage.feature.value
+        stage = ShotStage(stage_value)
+        try:
+            duration = int(raw_shot.get("duration_sec") or (5 if scenario_type == ScenarioType.product_video else 4))
+        except (TypeError, ValueError):
+            duration = 5
+        duration = max(3, min(8, duration))
+        shot_id = str(raw_shot.get("shot_id") or f"shot-{shot_index}")
+        image_prompt = self._cleanup_prompt_text(str(raw_shot.get("image_prompt") or ""))
+        video_prompt = self._sanitize_video_prompt(str(raw_shot.get("video_prompt") or image_prompt))
+        if not image_prompt:
+            image_prompt = self._default_image_prompt(brief.product_name, stage_value)
+        if not video_prompt:
+            video_prompt = self._sanitize_video_prompt(image_prompt)
+        delivery_purpose = self._normalize_delivery_purpose_value(raw_shot.get("delivery_purpose"))
+        if not delivery_purpose:
+            delivery_purpose = self._normalize_delivery_purpose_value(raw_shot.get("usage"))
+        if not delivery_purpose:
+            delivery_purpose = self._default_delivery_purpose(
+                scenario_type=scenario_type,
+                stage=stage,
+            )
+        return PlanShot(
+            shot_id=shot_id,
+            title=str(raw_shot.get("title") or f"镜头{shot_index}"),
+            intent=str(raw_shot.get("intent") or "强化核心卖点"),
+            duration_sec=duration,
+            stage=stage,
+            image_prompt=image_prompt,
+            video_prompt=video_prompt,
+            delivery_purpose=delivery_purpose,
+            retouch_prompt=str(raw_shot.get("retouch_prompt") or ""),
+            retouch_goal=str(raw_shot.get("retouch_goal") or "").strip() or None,
+            identity_lock_rules=[
+                str(item).strip()
+                for item in raw_shot.get("identity_lock_rules", [])
+                if str(item).strip()
+            ][:6],
+            local_edit_instructions=[
+                str(item).strip()
+                for item in raw_shot.get("local_edit_instructions", [])
+                if str(item).strip()
+            ][:8],
+            negative_constraints=[
+                str(item).strip()
+                for item in raw_shot.get("negative_constraints", [])
+                if str(item).strip()
+            ][:8],
+        )
+
+    def _normalize_delivery_purpose_value(self, value: Any) -> str:
+        if value is None:
+            return ""
+        text = str(value).strip()
+        if not text:
+            return ""
+        if text.lower() in {"none", "null", "n/a", "na", "-", "待定", "未定", "unknown"}:
+            return ""
+        return text
+
     def _scenario_focus_rules(self, scenario_type: ScenarioType) -> list[str]:
         if scenario_type == ScenarioType.product_image_suite:
             return [
@@ -1263,9 +1934,9 @@ class VolcScriptService:
             ]
         if scenario_type == ScenarioType.multi_angle_camera:
             return [
-                "围绕单张产品图输出多角度摄影方案，覆盖主视角、侧视角、俯仰变化",
+                "围绕上传原图中的同一对象输出视角变化方案，覆盖主视角、侧视角、俯仰变化",
                 "image_prompt必须包含相机角度语义（yaw/pitch/focal/distance）",
-                "保持主体尺寸、材质和光线风格连续，不得出现畸变或漂移",
+                "保持同一对象的外观、材质、纹理、轮廓和比例连续，不得重画主体本体、替换服装或改变对象类别",
             ]
         return [
             "15秒节奏：开场抓停留 -> 特点演示 -> 证据 -> 行动引导",
@@ -1325,7 +1996,7 @@ class VolcScriptService:
         if any(token in text for token in ["替换", "换脸", "模特替换"]):
             rules.extend(
                 [
-                    "替换人物时保持原图动作骨架、服装版型、机位构图和光线方向一致。",
+                    "替换人物时保持原图动作骨架、原套图服装版型、机位构图和光线方向一致。",
                     "禁止出现额外肢体、五官错位、边缘糊化和身份漂移。",
                 ]
             )
@@ -1344,7 +2015,7 @@ class VolcScriptService:
 
         replacement_guard = ""
         if scenario_type == ScenarioType.model_retouch:
-            replacement_guard = "保持同一人物身份，保留动作骨架、服装版型、构图与光线连续。"
+            replacement_guard = "保持同一人物身份，保留原套图动作骨架、服装版型、构图与光线连续，不得继承锚点服装。"
         anti_stereotype_guard = ""
         if scenario_type == ScenarioType.model_retouch:
             anti_stereotype_guard = "描述人物风格时避免刻板化与标签化表达。"
@@ -1444,12 +2115,12 @@ class VolcScriptService:
                 if not candidate.identity_lock_rules:
                     candidate.identity_lock_rules = [
                         "保持五官结构、脸型和骨相一致",
-                        "保持服装版型、动作骨架和构图一致",
+                        "保持原套图服装版型、动作骨架和构图一致",
                     ]
                 if not candidate.local_edit_instructions:
                     candidate.local_edit_instructions = [
                         "先修复动作和肢体连贯性，再修复面部状态",
-                        "最后统一肤色、光线和服装纹理",
+                        "最后统一肤色、光线和原套图服装纹理",
                     ]
                 if not candidate.negative_constraints:
                     candidate.negative_constraints = [
@@ -1459,6 +2130,182 @@ class VolcScriptService:
                     ]
             diversified.append(candidate)
         return diversified
+
+    def _quality_clause(self, quality_level: QualityLevel) -> str:
+        if quality_level == QualityLevel.premium:
+            return "画质目标4K商业级细节，纹理与材质层次优先，边缘干净无噪点"
+        if quality_level == QualityLevel.standard:
+            return "画质目标2K清晰，主体边缘干净，细节可用于电商投放"
+        return "画质目标1K稳定可用，主体清晰，优先保证执行稳定性"
+
+    def _join_prompt_sections(self, sections: list[str]) -> str:
+        cleaned = [
+            self._cleanup_prompt_text(item).strip("；;,. ")
+            for item in sections
+            if self._cleanup_prompt_text(item)
+        ]
+        return self._cleanup_prompt_text("；".join(cleaned))
+
+    def _trim_prompt(self, text: str, max_chars: int = 420) -> str:
+        value = self._cleanup_prompt_text(text)
+        if len(value) <= max_chars:
+            return value
+        return value[:max_chars].rstrip("；;,，。 ") + "。"
+
+    def _compile_image_generation_prompt(
+        self,
+        shot: PlanShot,
+        scenario_type: ScenarioType,
+        product_name: str,
+        quality_level: QualityLevel,
+    ) -> str:
+        base_prompt = self._compose_image_prompt(
+            product_name=product_name,
+            scenario_type=scenario_type,
+            stage=shot.stage.value,
+            shot_index=self._shot_index_from_id(shot.shot_id),
+            title=shot.title,
+            intent=shot.intent,
+            base_prompt=shot.image_prompt,
+        )
+        subject_line = f"主体:{product_name}"
+        if scenario_type == ScenarioType.multi_angle_camera:
+            subject_line = "主体:上传原图中的同一对象（保持原对象识别，不重绘主体，不替换服装）"
+        sections = [
+            subject_line,
+            f"镜头:{shot.title}",
+            f"目标:{shot.intent}",
+            f"用途:{shot.delivery_purpose}",
+            f"核心画面:{base_prompt}",
+            f"质感约束:{self._quality_clause(quality_level)}",
+            "统一约束:无文字、无字幕、无logo、无水印、无UI叠层",
+        ]
+        if scenario_type == ScenarioType.model_retouch:
+            sections.extend(
+                [
+                    "参考图角色声明: 图1=套图主图（决定动作、构图、背景、服装）；图2=模特锚点图（只决定人物身份、发型、肤色、身体比例，不决定服装与背景）",
+                    f"精修目标:{shot.retouch_goal or '保持身份一致并修复动作与面部细节'}",
+                    f"身份锁定:{' / '.join(shot.identity_lock_rules or ['保持五官结构与脸型一致'])}",
+                    f"局部修正:{' / '.join(shot.local_edit_instructions or ['先修动作，再修肤色与服装纹理'])}",
+                    f"避免事项:{' / '.join(shot.negative_constraints or ['禁止新增肢体', '禁止过度磨皮'])}",
+                ]
+            )
+        return self._trim_prompt(self._join_prompt_sections(sections), max_chars=500)
+
+    def _compile_video_generation_prompt(
+        self,
+        shot: PlanShot,
+        scenario_type: ScenarioType,
+        product_name: str,
+        quality_level: QualityLevel,
+    ) -> str:
+        shot_index = self._shot_index_from_id(shot.shot_id)
+        visual = self._remove_video_constraint_tail(
+            self._cleanup_prompt_text(shot.video_prompt or shot.image_prompt)
+        )
+        motion_raw = getattr(shot, "motion_direction", "") or ""
+        motion = self._cleanup_prompt_text(motion_raw)
+        if not motion:
+            stage_obj = shot.stage if isinstance(shot.stage, ShotStage) else ShotStage.feature
+            motion = self._default_motion_direction(stage_obj)
+        sections = [
+            f"Subject:{product_name}",
+            f"Shot:{shot.title}",
+            f"Intent:{shot.intent}",
+            f"ShotPurpose:{shot.delivery_purpose}",
+            "OutputConstraints: prohibit textual overlays and branding elements",
+            f"VisualPlan:{visual}",
+            f"MotionPath:{motion}",
+            f"CameraRhythm:{self._video_stage_spec(shot.stage.value, shot_index)}",
+            f"QualityTarget:{self._quality_clause(quality_level)}",
+        ]
+        if scenario_type == ScenarioType.model_retouch:
+            sections.append("IdentityConsistency: keep face structure, body proportion, clothing shape and lighting direction consistent")
+        compiled = self._join_prompt_sections(sections)
+        return self._trim_prompt(self._sanitize_video_prompt(compiled), max_chars=900)
+
+    def _compile_script_image_prompt(
+        self,
+        shot: ShotPlan,
+        product_name: str,
+    ) -> str:
+        shot_index = self._shot_index_from_id(shot.shot_id)
+        intent = self._cleanup_prompt_text(shot.on_screen_text or shot.narration or "镜头核心信息")
+        base = self._compose_image_prompt(
+            product_name=product_name,
+            scenario_type=ScenarioType.product_video,
+            stage=shot.stage.value,
+            shot_index=shot_index,
+            title=f"镜头{shot_index}",
+            intent=intent,
+            base_prompt=shot.reference_image_prompt or shot.visual_prompt,
+        )
+        sections = [
+            f"主体:{product_name}",
+            f"镜头{shot_index}:视频关键帧",
+            f"画面目标:{intent}",
+            f"关键帧描述:{base}",
+            f"运动衔接:{self._cleanup_prompt_text(shot.motion_direction or self._default_motion_direction(shot.stage))}",
+            "统一约束:无文字、无logo、无水印、无UI叠层",
+        ]
+        return self._trim_prompt(self._join_prompt_sections(sections), max_chars=480)
+
+    def _compile_script_video_prompt(
+        self,
+        shot: ShotPlan,
+        product_name: str,
+    ) -> str:
+        shot_index = self._shot_index_from_id(shot.shot_id)
+        intent = self._cleanup_prompt_text(shot.on_screen_text or shot.narration or "镜头核心信息")
+        visual = self._remove_video_constraint_tail(self._cleanup_prompt_text(shot.visual_prompt))
+        motion = self._cleanup_prompt_text(shot.motion_direction or self._default_motion_direction(shot.stage))
+        sections = [
+            f"Subject:{product_name}",
+            f"Shot:{shot_index}",
+            f"Intent:{intent}",
+            "OutputConstraints: prohibit textual overlays and branding elements",
+            f"VisualPlan:{visual}",
+            f"MotionPath:{motion}",
+            f"CameraRhythm:{self._video_stage_spec(shot.stage.value, shot_index)}",
+        ]
+        return self._trim_prompt(self._sanitize_video_prompt(self._join_prompt_sections(sections)), max_chars=900)
+
+    def _video_stage_spec(self, stage: str, shot_index: int) -> str:
+        if stage == ShotStage.hook.value:
+            return "0-2s fast hook, push-in camera, high visual contrast, stable axis"
+        if stage == ShotStage.proof.value:
+            return "proof-style comparison rhythm, slow lateral move, detail-first framing"
+        if stage == ShotStage.cta.value:
+            return "closing rhythm, camera settle and hold 1s, conversion-oriented composition"
+        return (
+            "mid rhythm, clear action path, camera movement smooth and readable, "
+            f"shot variation marker {shot_index}"
+        )
+
+    def _prompt_quality_score(self, prompt: str, mode: str) -> float:
+        text = self._cleanup_prompt_text(prompt).lower()
+        if not text:
+            return 0.0
+        if mode == "video":
+            markers = [
+                "subject:",
+                "shot:",
+                "intent:",
+                "motionpath:",
+                "camerarhythm:",
+                "outputconstraints:",
+            ]
+        else:
+            markers = [
+                "主体:",
+                "镜头:",
+                "目标:",
+                "核心画面:",
+                "质感约束:",
+                "统一约束:",
+            ]
+        hit = sum(1 for marker in markers if marker in text)
+        return min(1.0, hit / max(1, len(markers)))
 
     def _compose_image_prompt(
         self,
@@ -1474,6 +2321,8 @@ class VolcScriptService:
         stage_spec = self._image_stage_spec(stage=stage, shot_index=shot_index)
         scenario_spec = self._image_scenario_spec(scenario_type=scenario_type)
         anchor = f"{product_name}，{title}，表达{intent}"
+        if scenario_type == ScenarioType.multi_angle_camera:
+            anchor = f"上传原图中的同一对象，{title}，表达{intent}；只改变观察角度，不改变主体本体、服装、材质与轮廓"
 
         if self._needs_image_prompt_upgrade(base):
             return (
@@ -1518,6 +2367,27 @@ class VolcScriptService:
             "构图: 三分法突出主体；光线: 自然柔光与环境反射"
         )
 
+    def _stage_for_shot_index(self, shot_index: int) -> ShotStage:
+        if shot_index <= 1:
+            return ShotStage.hook
+        cycle = [ShotStage.feature, ShotStage.proof, ShotStage.cta]
+        return cycle[(shot_index - 2) % len(cycle)]
+
+    def _default_delivery_purpose(self, scenario_type: ScenarioType, stage: ShotStage) -> str:
+        if scenario_type == ScenarioType.product_image_suite:
+            mapping = {
+                ShotStage.hook: "主图",
+                ShotStage.feature: "场景图",
+                ShotStage.proof: "细节图",
+                ShotStage.cta: "对比图",
+            }
+            return mapping.get(stage, "场景图")
+        if scenario_type == ScenarioType.model_retouch:
+            return "单图精修交付"
+        if scenario_type == ScenarioType.multi_angle_camera:
+            return "角度展示图"
+        return "视频关键帧"
+
     def _image_scenario_spec(self, scenario_type: ScenarioType) -> str:
         if scenario_type == ScenarioType.product_image_suite:
             return (
@@ -1532,7 +2402,7 @@ class VolcScriptService:
         if scenario_type == ScenarioType.multi_angle_camera:
             return (
                 "风格: AI摄影棚多角度拍摄；透视与尺度稳定；"
-                "角度变化清晰且主体材质保持一致"
+                "角度变化清晰，但主体本体、服装、材质和轮廓必须保持一致"
             )
         return (
             "风格: 真实短视频关键帧；色彩克制自然；"
@@ -1785,6 +2655,7 @@ class VolcScriptService:
                     video_prompt=self._sanitize_video_prompt(
                         "模特中景，轻微转头展示面部细节提升，动作自然"
                     ),
+                    delivery_purpose="单图精修交付",
                     retouch_prompt="微调面部亮度和眼神，避免塑料感",
                 ),
                 PlanShot(
@@ -1795,6 +2666,7 @@ class VolcScriptService:
                     stage=ShotStage.feature,
                     image_prompt=f"{brief.product_name}模特图精修，调整手部与肩颈姿态，服装褶皱自然",
                     video_prompt=self._sanitize_video_prompt("半身镜头展示动作连贯性和服装质感"),
+                    delivery_purpose="单图精修交付",
                     retouch_prompt="修正手部姿态和肩颈线条，避免肢体扭曲",
                 ),
                 PlanShot(
@@ -1805,6 +2677,7 @@ class VolcScriptService:
                     stage=ShotStage.proof,
                     image_prompt=f"{brief.product_name}模特图精修，统一光影层次，背景干净，色彩高级",
                     video_prompt=self._sanitize_video_prompt("全身缓推镜头，展示整体精修前后差异"),
+                    delivery_purpose="单图精修交付",
                     retouch_prompt="统一白平衡，提升服装纹理清晰度",
                 ),
                 PlanShot(
@@ -1815,6 +2688,7 @@ class VolcScriptService:
                     stage=ShotStage.cta,
                     image_prompt=f"{brief.product_name}精修主图，主体突出，构图稳定，可直接电商投放",
                     video_prompt=self._sanitize_video_prompt("定格镜头展示最终精修主图效果"),
+                    delivery_purpose="单图精修交付",
                     retouch_prompt="输出主图比例并保持人物一致性",
                 ),
             ]
@@ -1849,8 +2723,9 @@ class VolcScriptService:
                     intent="建立主体形态和材质基准",
                     duration_sec=4,
                     stage=ShotStage.feature,
-                    image_prompt=f"{brief.product_name}，正面主视角，yaw 0°，pitch 0°，50mm，棚拍光线均匀，主体清晰",
+                    image_prompt="基于上传原图中的同一对象生成正面主视角，yaw 0°，pitch 0°，50mm；只改变观察角度，不改变主体本体、服装、材质与轮廓；保持原图对象识别一致。",
                     video_prompt=self._sanitize_video_prompt("正面稳定镜头，不要文字"),
+                    delivery_purpose="角度展示图",
                 ),
                 PlanShot(
                     shot_id="shot-left45",
@@ -1858,8 +2733,9 @@ class VolcScriptService:
                     intent="展示立体结构和侧面材质",
                     duration_sec=4,
                     stage=ShotStage.feature,
-                    image_prompt=f"{brief.product_name}，左前45度视角，yaw -45°，pitch 0°，50mm，保持尺度一致",
+                    image_prompt="基于上传原图中的同一对象生成左前45度视角，yaw -45°，pitch 0°，50mm；只改变观察角度，保持对象尺度、服装、材质与轮廓一致。",
                     video_prompt=self._sanitize_video_prompt("左前45度轻微平移镜头，不要文字"),
+                    delivery_purpose="角度展示图",
                 ),
                 PlanShot(
                     shot_id="shot-right45",
@@ -1867,8 +2743,9 @@ class VolcScriptService:
                     intent="补全另一侧结构信息",
                     duration_sec=4,
                     stage=ShotStage.feature,
-                    image_prompt=f"{brief.product_name}，右前45度视角，yaw 45°，pitch 0°，50mm，棚拍质感一致",
+                    image_prompt="基于上传原图中的同一对象生成右前45度视角，yaw 45°，pitch 0°，50mm；只改变观察角度，保持对象尺度、服装、材质与轮廓一致。",
                     video_prompt=self._sanitize_video_prompt("右前45度稳定镜头，不要文字"),
+                    delivery_purpose="角度展示图",
                 ),
                 PlanShot(
                     shot_id="shot-top",
@@ -1876,8 +2753,9 @@ class VolcScriptService:
                     intent="展示顶部细节与结构",
                     duration_sec=4,
                     stage=ShotStage.proof,
-                    image_prompt=f"{brief.product_name}，俯拍视角，yaw 0°，pitch -25°，35mm，透视自然不过度拉伸",
+                    image_prompt="基于上传原图中的同一对象生成俯拍视角，yaw 0°，pitch -25°，35mm；只改变观察角度，透视自然，不过度拉伸，不改变主体本体。",
                     video_prompt=self._sanitize_video_prompt("俯拍慢推镜头，不要文字"),
+                    delivery_purpose="角度展示图",
                 ),
             ]
             shots = self._ensure_plan_prompt_diversity(
@@ -1910,6 +2788,7 @@ class VolcScriptService:
                     video_prompt=self._sanitize_video_prompt(
                         f"{brief.product_name}特写开场，快速推进到核心外观细节，光线自然高级感"
                     ),
+                    delivery_purpose="视频关键帧",
                 ),
                 PlanShot(
                     shot_id="shot-2",
@@ -1921,6 +2800,7 @@ class VolcScriptService:
                     video_prompt=self._sanitize_video_prompt(
                         f"{brief.product_name}中景演示，手部操作连贯，镜头平稳推进"
                     ),
+                    delivery_purpose="视频关键帧",
                 ),
                 PlanShot(
                     shot_id="shot-3",
@@ -1932,6 +2812,7 @@ class VolcScriptService:
                     video_prompt=self._sanitize_video_prompt(
                         f"{brief.product_name}收束镜头，稳定构图，强化购买动机"
                     ),
+                    delivery_purpose="视频关键帧",
                 ),
             ]
             shots = self._ensure_plan_prompt_diversity(
@@ -1958,9 +2839,10 @@ class VolcScriptService:
                 title="主图精修",
                 intent="输出电商主图",
                 duration_sec=4,
-                stage=ShotStage.feature,
+                stage=ShotStage.hook,
                 image_prompt=f"{brief.product_name}电商主图精修，主体清晰，背景干净，质感提升",
                 video_prompt=self._sanitize_video_prompt("产品静态展示，细节层次清晰"),
+                delivery_purpose="主图",
             ),
             PlanShot(
                 shot_id="shot-2",
@@ -1970,6 +2852,7 @@ class VolcScriptService:
                 stage=ShotStage.feature,
                 image_prompt=f"{brief.product_name}生活场景图，光线自然，主体突出，氛围真实",
                 video_prompt=self._sanitize_video_prompt("中景展示产品融入生活场景"),
+                delivery_purpose="场景图",
             ),
             PlanShot(
                 shot_id="shot-3",
@@ -1979,6 +2862,7 @@ class VolcScriptService:
                 stage=ShotStage.proof,
                 image_prompt=f"{brief.product_name}细节特写，材质纹理清晰，构图稳定",
                 video_prompt=self._sanitize_video_prompt("特写慢推镜头，展示材质细节"),
+                delivery_purpose="细节图",
             ),
             PlanShot(
                 shot_id="shot-4",
@@ -1988,6 +2872,7 @@ class VolcScriptService:
                 stage=ShotStage.cta,
                 image_prompt=f"{brief.product_name}平台通用收束图，主体居中，留白合理",
                 video_prompt=self._sanitize_video_prompt("稳定镜头收束，保持主体一致"),
+                delivery_purpose="对比图",
             ),
         ]
         shots = self._ensure_plan_prompt_diversity(
@@ -2194,13 +3079,7 @@ class VolcScriptService:
 
     def _sanitize_video_prompt(self, text: str) -> str:
         value = self._cleanup_prompt_text(text)
-        # 清理已有的英文禁词尾巴，统一用标准后缀重新注入，避免出现残缺句子
-        value = re.sub(
-            r"No text[^.。]*[.。]?",
-            "",
-            value,
-            flags=re.IGNORECASE,
-        )
+        value = self._remove_video_constraint_tail(value)
         banned_words = [
             "字幕",
             "文字",
@@ -2218,6 +3097,14 @@ class VolcScriptService:
         if not value:
             return suffix
         return f"{value}。{suffix}"
+
+    def _remove_video_constraint_tail(self, text: str) -> str:
+        return re.sub(
+            r"No text[^.。]*[.。]?",
+            "",
+            str(text or ""),
+            flags=re.IGNORECASE,
+        ).strip(" ，。;")
 
     def _default_image_prompt(self, product_name: str, stage: str) -> str:
         if stage == ShotStage.hook.value:

@@ -1,56 +1,63 @@
-# Repository Guidelines
+# AI摄影棚 Agent 准则（强制执行）
 
-## Project Structure & Module Organization
-- `app/main.py` hosts the FastAPI app, routes, and static mount points.
-- `app/services/` contains pipeline logic and provider integrations (`volc_service.py`, `sora_service.py`, `reference_image_service.py`, `assembly_service.py`).
-- `app/schemas.py` defines shared Pydantic models; `app/store.py` is the in-memory state/log store.
-- `app/utils/` holds reusable helpers (JSON repair, ffmpeg/image tools, logging setup).
-- `frontend/` is the Next.js App Router frontend; build output is served from `frontend/out` via `/app/*`.
-- `tests/` includes API/service/frontend smoke tests; `data/` stores uploads, render outputs, and runtime logs.
+> 目标：不重复犯错、交付可验证、流程可追踪。任何改动必须遵守本文件。
 
-## Build, Test, and Development Commands
-- `python3 -m venv .venv && source .venv/bin/activate` — create local Python env.
-- `pip install -e .` — install app dependencies in editable mode.
-- `make run` (or `uvicorn app.main:app --reload --port 12222`) — start local server.
-- `make test` (or `pytest -q`) — run the test suite.
-- `make lint` (or `ruff check app tests`) — run lint checks.
+## 1. 文档体系（必须同步）
+- 文档索引：`/Volumes/MAC 1/shipin/docs/INDEX.md`
+- 任何接口/交互/流程变更必须同步更新对应文档。
+- 每次交付后追加复盘：`/Volumes/MAC 1/shipin/docs/agent/RETRO_LOG.md`
 
-Example health check: `curl http://127.0.0.1:12222/healthz`.
+## 2. 核心交付原则
+- **先设计后实现**：交互/流程变更先写清楚再动代码。
+- **不重复犯错**：错误必须记录、归因、并写入防护措施。
+- **用户不做首轮排错**：本地能复现的问题必须先修复再交付。
+- **单步主 CTA**：每个步骤只有一个主按钮，其余进“高级/更多”。
+- **状态可见**：所有异步必须有 `submitting → running → success/failed`。
+- **前端改动必构建**：任何前端修改需先 `npm --prefix frontend run build` 再重启服务。
+- **交付前自启服务**：每次交付前主动重启前后端并自测关键路径，不要求用户先重启。
+- **走查用 Playwright CLI**：交互/流程走查必须使用 Playwright CLI Skill 执行并记录。
+- **设计用 UI/UX Pro Max**：所有设计与交互方案必须使用 UI/UX Pro Max Skill 产出与评审。
 
-## Coding Style & Naming Conventions
-- Python 3.10+ with 4-space indentation; keep line length near Ruff limit (`100`).
-- Use `snake_case` for files/functions/variables, `PascalCase` for classes, and explicit type hints for public methods.
-- Keep service methods focused: parse/validate first, then call external provider, then normalize output.
-- Prefer small utility helpers over duplicated inline logic.
+## 3. 工具与场景边界（强约束）
+- 图片类工具不出现视频字段（如时长、帧数）。
+- 视频类工具不出现图片批量/角度字段。
+- 多角度工具仅展示机位控制与生成，不展示脚本/分镜字段。
 
-## Testing Guidelines
-- Test framework: `pytest` with tests under `tests/test_*.py`.
-- Add unit tests for new parsing/validation branches and API tests for route-level behavior.
-- When changing prompt-to-JSON logic, include failure-path tests.
-- Keep tests deterministic: use mock providers (`MVP_USE_MOCK_PROVIDERS=true`) unless intentionally validating live integrations.
+## 4. OSS 直传规范
+- 创建任务前**前端直传 OSS**，后端只接 URL。
+- 创建后 **必须秒进工作台**（上传不阻塞创建）。
+- `/api/v1/oss/sign` 返回字段必须完整（含 `updated_at`）。
 
-## Commit & Pull Request Guidelines
-- Follow Conventional Commits (e.g., `feat: add project log endpoint`, `fix: escape script text in frontend`).
-- PRs should include: purpose, key files changed, test evidence (`pytest`, `ruff`), and screenshots/GIFs.
-- Note env/config changes (`.env.example`, provider keys, ffmpeg) in the PR description.
+## 5. 架构与代码索引
+- 后端入口：`/Volumes/MAC 1/shipin/app/main.py`
+- 服务编排：`/Volumes/MAC 1/shipin/app/services/`
+- 数据模型：`/Volumes/MAC 1/shipin/app/schemas.py`
+- 状态存储：`/Volumes/MAC 1/shipin/app/store.py`
+- 前端入口：`/Volumes/MAC 1/shipin/frontend/app/page.jsx`
 
-## Security & Configuration Tips
-- Never commit real API keys; keep secrets in `.env` and maintain placeholders in `.env.example`.
-- Default to mock mode for development unless live provider testing is required.
-- Check `data/logs/app.log` and `/api/v1/projects/{id}/logs` for pipeline debugging.
+## 6. 运行与测试（必须通过）
+- 启动：`python3 -m uvicorn app.main:app --host 0.0.0.0 --port 5005`
+- Lint：`python3 -m ruff check app tests`
+- Test：`python3 -m pytest -q`
+- Smoke：创建→方案→生成→结果完整链路
+ - 五工具全量自查后再交付用户测试（商品棚拍/模特精修/多角度/15秒/讲解视频）
 
-## Product & UX Guardrails (MUST)
-- Tool forms must be scenario-specific: image tools must not display video-only fields (e.g., duration, frame count), and video tools must not display image-only controls.
-- Primary CTA must be singular per step; non-primary actions go to secondary/advanced actions.
-- Every async action must show explicit state: `submitting` → `running` → `success/failed` with retry entry.
-- Distinguish clearly between public studio showcase and private user assets: homepage is for showcase/conversion, while `我的素材库` is personal/private.
-- The tools homepage must include an operational showcase block (grouped sample sets) to support commercial conversion, not just functional forms.
-- Before handoff, run a visual walkthrough for each tool page: create form, state transitions, and navigation return path to `/app/tools`.
-- Use owner mindset: proactively identify UX/product risks and propose at least one better alternative before implementation.
-- For homepage and funnel changes, include “运营目标” checks: first-screen value proposition, sample-driven conversion entry (`拍同款`), and commercial blocks (套图销售/二次编辑).
+## 7. UX 验收（必须通过）
+- 任意页面 1 次点击可回 `/app/tools`
+- 无遮罩阻塞主操作
+- 上传按钮可点击且可撤回
+- 日志默认折叠，不遮挡主操作区
+- **批量创建自动跳转**：创建成功后必须自动进入第一个任务工作台；若不可跳转需提供清晰入口按钮。
 
-## Delivery Rule (MUST)
-- Before handoff, run `python3 -m ruff check app tests`, `python3 -m pytest -q`, and a local API smoke flow.
-- Do not ask the product owner to do first-round debugging for issues the team can reproduce locally.
-- If live third-party APIs are unreachable, state that explicitly and provide logs plus fallback validation evidence.
-- UX acceptance is part of delivery: verify no blocking overlay, no dead CTA, and no scenario-field leakage.
+## 8. 复盘与改进（强制）
+- 每次 bug：写入 `RETRO_LOG.md`
+- 每次改动：更新 `AGENT_PLAYBOOK.md` 中防护措施
+- 交付前执行 `/docs/agent/CHECKLIST.md`
+
+## 9. 用户建模与评审方法（强制）
+- 互联网产品 UI 改版前必须完成 Persona 建模（至少 10 类用户：职业/年龄/兴趣/设备/场景/目标）。
+- 设计评审必须使用多轮吐槽法：R1观感、R2动线、R3文案、R4商业风险、R5情绪曲线、R6付费信任。
+- 每轮改版必须产出 Persona × 页面优先级矩阵（P0/P1/P2），并冻结当轮改造范围。
+- 吐槽输出必须包含“用户故事化片段”（人物、时间、任务目标、阻塞点、情绪变化），禁止只写抽象结论。
+- 用户故事文档完成后，必须同步产出“执行改造单”（页面/组件/验收标准/指标），禁止停留在情绪反馈层。
+- 缺少 Persona 文档与优先级矩阵，禁止进入 UI 开发阶段。

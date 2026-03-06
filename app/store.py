@@ -5,17 +5,22 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
+from threading import Thread
+from time import sleep
 from typing import Any, Callable, TypeVar
 from uuid import uuid4
 
 from app.schemas import (
     AssetRecord,
+    PointsLedgerEntry,
     LogLevel,
     ProjectLog,
     ProjectRecord,
     QualityReport,
+    RechargeOrder,
     RenderRecord,
     ReviewDecision,
+    UserRecord,
 )
 
 T = TypeVar("T")
@@ -49,6 +54,7 @@ class InMemoryStore:
         oss_bucket: str | None = None,
         oss_endpoint: str | None = None,
         oss_state_key: str = "photo2video/state/store.json",
+        async_persist: bool = False,
     ) -> None:
         self._projects: dict[str, ProjectRecord] = {}
         self._renders: dict[str, RenderRecord] = {}
@@ -56,6 +62,10 @@ class InMemoryStore:
         self._quality_reports: dict[str, QualityReport] = {}
         self._review_decisions: dict[str, ReviewDecision] = {}
         self._project_logs: dict[str, list[ProjectLog]] = {}
+        self._users: dict[str, UserRecord] = {}
+        self._user_password_hashes: dict[str, str] = {}
+        self._recharge_orders: dict[str, RechargeOrder] = {}
+        self._points_ledgers: dict[str, PointsLedgerEntry] = {}
         self._lock = Lock()
         self._persist_path = persist_path
         self._redis_url = redis_url
@@ -63,6 +73,9 @@ class InMemoryStore:
         self._redis_client = None
         self._oss_bucket = None
         self._oss_state_key = oss_state_key
+        self._async_persist = bool(async_persist)
+        self._persist_dirty = False
+        self._persist_scheduled = False
 
         if self._redis_url:
             if redis is None:
@@ -83,6 +96,7 @@ class InMemoryStore:
                 )
             auth = oss2.Auth(oss_access_key, oss_secret_key)
             self._oss_bucket = oss2.Bucket(auth, f"https://{oss_endpoint}", oss_bucket)
+            self._async_persist = True
             self._load_from_persistence()
         elif self._persist_path:
             self._persist_path.parent.mkdir(parents=True, exist_ok=True)
@@ -97,7 +111,7 @@ class InMemoryStore:
     def get_project(self, project_id: str) -> ProjectRecord | None:
         with self._lock:
             project = self._projects.get(project_id)
-        if project is not None or not self._has_remote_persistence:
+        if project is not None or not self._has_remote_persistence or self._async_persist:
             return project
         self._sync_from_remote()
         with self._lock:
@@ -111,7 +125,7 @@ class InMemoryStore:
         if self._has_remote_persistence:
             with self._lock:
                 missing = project_id not in self._projects
-            if missing:
+            if missing and not self._async_persist:
                 self._sync_from_remote()
         with self._lock:
             project = self._projects[project_id]
@@ -128,7 +142,7 @@ class InMemoryStore:
     def get_render(self, render_id: str) -> RenderRecord | None:
         with self._lock:
             render = self._renders.get(render_id)
-        if render is not None or not self._has_remote_persistence:
+        if render is not None or not self._has_remote_persistence or self._async_persist:
             return render
         self._sync_from_remote()
         with self._lock:
@@ -154,7 +168,7 @@ class InMemoryStore:
     def get_asset(self, asset_id: str) -> AssetRecord | None:
         with self._lock:
             asset = self._assets.get(asset_id)
-        if asset is not None or not self._has_remote_persistence:
+        if asset is not None or not self._has_remote_persistence or self._async_persist:
             return asset
         self._sync_from_remote()
         with self._lock:
@@ -226,6 +240,14 @@ class InMemoryStore:
             items.sort(key=lambda item: item.created_at)
             return items
 
+    def list_quality_reports_global(self, limit: int = 50000) -> list[QualityReport]:
+        with self._lock:
+            items = list(self._quality_reports.values())
+            items.sort(key=lambda item: item.created_at, reverse=True)
+            if limit <= 0:
+                return []
+            return items[:limit]
+
     def add_review_decision(self, decision: ReviewDecision) -> None:
         with self._lock:
             self._review_decisions[decision.decision_id] = decision
@@ -269,7 +291,7 @@ class InMemoryStore:
             return logs[-limit:]
 
     def list_projects(self, limit: int = 20, query: str | None = None) -> list[ProjectRecord]:
-        if self._has_remote_persistence:
+        if self._has_remote_persistence and not self._async_persist:
             self._sync_from_remote()
         with self._lock:
             projects = list(self._projects.values())
@@ -289,6 +311,95 @@ class InMemoryStore:
             if limit <= 0:
                 return []
             return projects[:limit]
+
+    def add_user(self, user: UserRecord) -> None:
+        with self._lock:
+            self._users[user.username] = user
+            self._persist_locked()
+
+    def get_user(self, username: str) -> UserRecord | None:
+        with self._lock:
+            user = self._users.get(username)
+        if user is not None or not self._has_remote_persistence or self._async_persist:
+            return user
+        self._sync_from_remote()
+        with self._lock:
+            return self._users.get(username)
+
+    def update_user(self, username: str, updater: Callable[[UserRecord], None]) -> UserRecord:
+        if self._has_remote_persistence:
+            with self._lock:
+                missing = username not in self._users
+            if missing and not self._async_persist:
+                self._sync_from_remote()
+        with self._lock:
+            user = self._users[username]
+            updater(user)
+            user.updated_at = utc_now()
+            self._persist_locked()
+            return user
+
+    def list_users(self) -> list[UserRecord]:
+        if self._has_remote_persistence and not self._async_persist:
+            self._sync_from_remote()
+        with self._lock:
+            rows = list(self._users.values())
+            rows.sort(key=lambda item: item.created_at)
+            return rows
+
+    def set_user_password_hash(self, username: str, password_hash: str) -> None:
+        with self._lock:
+            self._user_password_hashes[username] = password_hash
+            self._persist_locked()
+
+    def get_user_password_hash(self, username: str) -> str:
+        with self._lock:
+            return self._user_password_hashes.get(username, "")
+
+    def add_recharge_order(self, order: RechargeOrder) -> None:
+        with self._lock:
+            self._recharge_orders[order.order_id] = order
+            self._persist_locked()
+
+    def get_recharge_order(self, order_id: str) -> RechargeOrder | None:
+        with self._lock:
+            row = self._recharge_orders.get(order_id)
+        if row is not None or not self._has_remote_persistence or self._async_persist:
+            return row
+        self._sync_from_remote()
+        with self._lock:
+            return self._recharge_orders.get(order_id)
+
+    def update_recharge_order(self, order_id: str, updater: Callable[[RechargeOrder], None]) -> RechargeOrder:
+        with self._lock:
+            row = self._recharge_orders[order_id]
+            updater(row)
+            row.updated_at = utc_now()
+            self._persist_locked()
+            return row
+
+    def list_recharge_orders(self, username: str | None = None, limit: int = 100) -> list[RechargeOrder]:
+        with self._lock:
+            rows = list(self._recharge_orders.values())
+            if username:
+                rows = [item for item in rows if item.username == username]
+            rows.sort(key=lambda item: item.created_at, reverse=True)
+            if limit <= 0:
+                return []
+            return rows[:limit]
+
+    def add_points_ledger(self, item: PointsLedgerEntry) -> None:
+        with self._lock:
+            self._points_ledgers[item.ledger_id] = item
+            self._persist_locked()
+
+    def list_points_ledger(self, username: str, limit: int = 200) -> list[PointsLedgerEntry]:
+        with self._lock:
+            rows = [item for item in self._points_ledgers.values() if item.username == username]
+            rows.sort(key=lambda item: item.created_at, reverse=True)
+            if limit <= 0:
+                return []
+            return rows[:limit]
 
     @property
     def _has_remote_persistence(self) -> bool:
@@ -337,6 +448,10 @@ class InMemoryStore:
             quality_rows = raw.get("quality_reports", [])
             decision_rows = raw.get("review_decisions", [])
             log_rows = raw.get("project_logs", {})
+            user_rows = raw.get("users", [])
+            user_password_hashes = raw.get("user_password_hashes", {})
+            recharge_rows = raw.get("recharge_orders", [])
+            ledger_rows = raw.get("points_ledgers", [])
 
             projects = {row["project_id"]: ProjectRecord.model_validate(row) for row in project_rows}
             renders = {row["render_id"]: RenderRecord.model_validate(row) for row in render_rows}
@@ -346,6 +461,13 @@ class InMemoryStore:
             }
             review_decisions = {
                 row["decision_id"]: ReviewDecision.model_validate(row) for row in decision_rows
+            }
+            users = {row["username"]: UserRecord.model_validate(row) for row in user_rows}
+            recharge_orders = {
+                row["order_id"]: RechargeOrder.model_validate(row) for row in recharge_rows
+            }
+            points_ledgers = {
+                row["ledger_id"]: PointsLedgerEntry.model_validate(row) for row in ledger_rows
             }
             loaded_logs: dict[str, list[ProjectLog]] = {}
             if isinstance(log_rows, dict):
@@ -363,6 +485,13 @@ class InMemoryStore:
                 self._quality_reports = quality_reports
                 self._review_decisions = review_decisions
                 self._project_logs = loaded_logs
+                self._users = users
+                self._user_password_hashes = {
+                    str(k): str(v)
+                    for k, v in (user_password_hashes.items() if isinstance(user_password_hashes, dict) else [])
+                }
+                self._recharge_orders = recharge_orders
+                self._points_ledgers = points_ledgers
             if self._redis_client is not None:
                 logger.info("Loaded persisted store from redis key %s", self._redis_state_key)
             elif self._oss_bucket is not None:
@@ -391,9 +520,16 @@ class InMemoryStore:
                 self._quality_reports = {}
                 self._review_decisions = {}
                 self._project_logs = {}
+                self._users = {}
+                self._user_password_hashes = {}
+                self._recharge_orders = {}
+                self._points_ledgers = {}
 
     def _persist_locked(self) -> None:
         if not self._persist_path and self._redis_client is None and self._oss_bucket is None:
+            return
+        if self._async_persist:
+            self._schedule_async_persist()
             return
         payload = {
             "schema_version": self.STORE_SCHEMA_VERSION,
@@ -410,6 +546,10 @@ class InMemoryStore:
                 project_id: [event.model_dump(mode="json") for event in logs]
                 for project_id, logs in self._project_logs.items()
             },
+            "users": [item.model_dump(mode="json") for item in self._users.values()],
+            "user_password_hashes": dict(self._user_password_hashes),
+            "recharge_orders": [item.model_dump(mode="json") for item in self._recharge_orders.values()],
+            "points_ledgers": [item.model_dump(mode="json") for item in self._points_ledgers.values()],
         }
         payload_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         if self._redis_client is not None:
@@ -440,3 +580,67 @@ class InMemoryStore:
         tmp_path = self._persist_path.with_suffix(self._persist_path.suffix + ".tmp")
         tmp_path.write_text(payload_json, encoding="utf-8")
         tmp_path.replace(self._persist_path)
+
+    def _schedule_async_persist(self) -> None:
+        self._persist_dirty = True
+        if self._persist_scheduled:
+            return
+        self._persist_scheduled = True
+        Thread(target=self._persist_worker, daemon=True).start()
+
+    def _persist_worker(self) -> None:
+        while True:
+            sleep(0.3)
+            with self._lock:
+                if not self._persist_dirty:
+                    self._persist_scheduled = False
+                    return
+                self._persist_dirty = False
+                projects = list(self._projects.values())
+                renders = list(self._renders.values())
+                assets = list(self._assets.values())
+                quality_reports = list(self._quality_reports.values())
+                review_decisions = list(self._review_decisions.values())
+                project_logs = dict(self._project_logs)
+                users = list(self._users.values())
+                user_password_hashes = dict(self._user_password_hashes)
+                recharge_orders = list(self._recharge_orders.values())
+                points_ledgers = list(self._points_ledgers.values())
+
+            payload = {
+                "schema_version": self.STORE_SCHEMA_VERSION,
+                "projects": [item.model_dump(mode="json") for item in projects],
+                "renders": [item.model_dump(mode="json") for item in renders],
+                "assets": [item.model_dump(mode="json") for item in assets],
+                "quality_reports": [item.model_dump(mode="json") for item in quality_reports],
+                "review_decisions": [item.model_dump(mode="json") for item in review_decisions],
+                "project_logs": {
+                    project_id: [event.model_dump(mode="json") for event in logs]
+                    for project_id, logs in project_logs.items()
+                },
+                "users": [item.model_dump(mode="json") for item in users],
+                "user_password_hashes": user_password_hashes,
+                "recharge_orders": [item.model_dump(mode="json") for item in recharge_orders],
+                "points_ledgers": [item.model_dump(mode="json") for item in points_ledgers],
+            }
+            payload_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            try:
+                if self._redis_client is not None:
+                    self._redis_client.set(self._redis_state_key, payload_json)
+                elif self._oss_bucket is not None:
+                    self._oss_bucket.put_object(
+                        self._oss_state_key,
+                        payload_json.encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                    )
+                elif self._persist_path is not None:
+                    tmp_path = self._persist_path.with_suffix(self._persist_path.suffix + ".tmp")
+                    tmp_path.write_text(payload_json, encoding="utf-8")
+                    tmp_path.replace(self._persist_path)
+            except Exception as exc:  # pragma: no cover - network instability
+                if self._redis_client is not None:
+                    logger.warning("Failed to persist store to redis key %s: %s", self._redis_state_key, exc)
+                elif self._oss_bucket is not None:
+                    logger.warning("Failed to persist store to OSS key %s: %s", self._oss_state_key, exc)
+                else:
+                    logger.warning("Failed to persist store to file %s: %s", self._persist_path, exc)

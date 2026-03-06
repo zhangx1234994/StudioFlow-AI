@@ -1,0 +1,22 @@
+[Unit]
+Description=StudioFlow AI Photo Studio API
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/studioflow-ai
+EnvironmentFile=/opt/studioflow-ai/.env
+ExecStart=/usr/bin/python3 -m uvicorn app.main:app --host 0.0.0.0 --port 5005
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+
+# hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt/studioflow-ai/data /opt/studioflow-ai/output
+
+[Install]
+WantedBy=multi-user.target

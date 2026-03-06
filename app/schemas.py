@@ -75,6 +75,12 @@ class GoalType(str, Enum):
     review = "review"
 
 
+class WorkflowMode(str, Enum):
+    default = "default"
+    product_set = "product_set"
+    retouch_per_image = "retouch_per_image"
+
+
 class ShotApprovalStatus(str, Enum):
     pending = "pending"
     approved = "approved"
@@ -91,6 +97,22 @@ class IdentityMode(str, Enum):
 class IdentityStatus(str, Enum):
     pending = "pending"
     confirmed = "confirmed"
+
+
+class BatchRole(str, Enum):
+    controller = "controller"
+    member = "member"
+
+
+class BackgroundPolicy(str, Enum):
+    keep_original = "keep_original"
+    regenerate = "regenerate"
+
+
+class RetouchStrength(str, Enum):
+    light = "light"
+    medium = "medium"
+    heavy = "heavy"
 
 
 class AssetKind(str, Enum):
@@ -129,6 +151,32 @@ class ReviewAction(str, Enum):
     regenerate = "regenerate"
 
 
+class UserRole(str, Enum):
+    admin = "admin"
+    operator = "operator"
+    member = "member"
+
+
+class AccountStatus(str, Enum):
+    trial = "trial"
+    active = "active"
+    suspended = "suspended"
+    frozen = "frozen"
+
+
+class LedgerKind(str, Enum):
+    recharge = "recharge"
+    consume_generation = "consume_generation"
+    share_reward = "share_reward"
+    manual_adjust = "manual_adjust"
+
+
+class RechargeStatus(str, Enum):
+    pending = "pending"
+    paid = "paid"
+    canceled = "canceled"
+
+
 class PromptInputForm(BaseModel):
     goal: str = Field(default="提升转化", max_length=160)
     style: str = Field(default="真实质感，轻商业感", max_length=160)
@@ -165,6 +213,19 @@ class BatchItem(BaseModel):
     desired_duration_sec: int = Field(default=15, ge=15, le=50)
 
 
+class SetConfig(BaseModel):
+    target_final_count: int = Field(default=9, ge=3, le=30)
+    takes_per_shot: int = Field(default=3, ge=1, le=4)
+    required_min_candidates: int = Field(default=9, ge=3, le=120)
+
+
+class BatchStats(BaseModel):
+    total_images: int = Field(default=0, ge=0)
+    done_images: int = Field(default=0, ge=0)
+    failed_images: int = Field(default=0, ge=0)
+    queued_images: int = Field(default=0, ge=0)
+
+
 class VisualInsight(BaseModel):
     summary: str
     visible_points: list[str] = Field(default_factory=list)
@@ -179,6 +240,7 @@ class PlanShot(BaseModel):
     stage: ShotStage = ShotStage.feature
     image_prompt: str
     video_prompt: str
+    delivery_purpose: str | None = None
     retouch_prompt: str | None = None
     retouch_goal: str | None = None
     identity_lock_rules: list[str] = Field(default_factory=list)
@@ -280,6 +342,7 @@ class ClipVariant(BaseModel):
 class AssetRecord(BaseModel):
     asset_id: str
     project_id: str
+    workspace_id: str = "default_workspace"
     tool_type: ToolType = ToolType.intro_video_multi_script
     kind: AssetKind
     source_type: AssetSourceType = AssetSourceType.generated
@@ -322,6 +385,8 @@ class ReviewDecision(BaseModel):
 
 class ProjectRecord(BaseModel):
     project_id: str
+    owner_username: str = "admin"
+    workspace_id: str = "default_workspace"
     tool_type: ToolType = ToolType.intro_video_multi_script
     status: ProjectStatus
     task_status: TaskRunStatus = TaskRunStatus.queued
@@ -336,11 +401,31 @@ class ProjectRecord(BaseModel):
     quality_level: QualityLevel = QualityLevel.standard
     prompt_inputs: PromptInputForm = Field(default_factory=PromptInputForm)
     batch_group_id: str | None = None
+    batch_role: BatchRole = BatchRole.member
+    workflow_mode: WorkflowMode = WorkflowMode.default
     identity_required: bool = False
     identity_mode: IdentityMode = IdentityMode.none
     identity_status: IdentityStatus = IdentityStatus.pending
     identity_asset_id: str | None = None
+    identity_anchor_asset_id: str | None = None
+    background_policy: BackgroundPolicy = BackgroundPolicy.keep_original
+    output_aspect_ratio: Literal[
+        "original",
+        "1:1",
+        "2:3",
+        "3:2",
+        "3:4",
+        "4:3",
+        "4:5",
+        "5:4",
+        "9:16",
+        "16:9",
+        "21:9",
+    ] = "original"
+    retouch_strength: RetouchStrength = RetouchStrength.light
     camera_inputs: dict[str, Any] = Field(default_factory=dict)
+    set_config: SetConfig | None = None
+    batch_stats: BatchStats | None = None
     insight: VisualInsight | None = None
     project_plan: ProjectPlan | None = None
     prompt_pack: PromptPack | None = None
@@ -428,6 +513,27 @@ class UpdatePromptInputsRequest(BaseModel):
 
 class GeneratePlanRequest(BaseModel):
     force: bool = False
+    async_mode: bool = False
+
+
+class GenerateIdentityCandidateRequest(BaseModel):
+    force: bool = False
+    identity_source: Literal["beautify_uploaded", "generate_new"] = "beautify_uploaded"
+    identity_requirements: str = Field(default="", max_length=300)
+    lighting_preset: str = Field(default="softbox_clean", max_length=40)
+    framing_preset: str = Field(default="half_body", max_length=40)
+    angle_preset: str = Field(default="front", max_length=40)
+    preserve_pose: bool = True
+
+
+class BatchIdentityGenerateRequest(BaseModel):
+    force: bool = False
+    identity_source: Literal["use_uploaded", "beautify_uploaded", "generate_new"] = "use_uploaded"
+    identity_requirements: str = Field(default="", max_length=300)
+    lighting_preset: str = Field(default="softbox_clean", max_length=40)
+    framing_preset: str = Field(default="half_body", max_length=40)
+    angle_preset: str = Field(default="front", max_length=40)
+    preserve_pose: bool = True
 
 
 class RetryProjectRequest(BaseModel):
@@ -442,6 +548,44 @@ class IdentityActionRequest(BaseModel):
 class IdentityActionResponse(BaseModel):
     project: ProjectRecord
     asset: AssetRecord | None = None
+
+
+class BatchIdentityConfirmRequest(BaseModel):
+    asset_id: str
+
+
+class BatchIdentityUploadRequest(BaseModel):
+    image_public_url: str = Field(min_length=1, max_length=500)
+    image_mime: str | None = None
+    image_suffix: str | None = None
+
+
+class BatchIdentityClearUploadRequest(BaseModel):
+    asset_id: str | None = None
+
+
+class BatchGenerateRequest(BaseModel):
+    async_mode: bool = True
+    output_aspect_ratio: Literal[
+        "original",
+        "1:1",
+        "2:3",
+        "3:2",
+        "3:4",
+        "4:3",
+        "4:5",
+        "5:4",
+        "9:16",
+        "16:9",
+        "21:9",
+    ] = "original"
+    image_resolution: Literal["1K", "2K", "4K"] | None = None
+    image_output_format: Literal["png", "jpg", "jpeg"] = "png"
+    project_ids: list[str] = Field(default_factory=list, max_length=200)
+
+
+class BatchRetryRequest(BaseModel):
+    project_ids: list[str] = Field(default_factory=list, max_length=200)
 
 
 class CameraAngleInput(BaseModel):
@@ -495,7 +639,7 @@ class GenerateImagesRequest(BaseModel):
         "21:9",
         "auto",
     ] = "1:1"
-    image_resolution: Literal["1K", "2K", "4K"] = "1K"
+    image_resolution: Literal["1K", "2K", "4K"] | None = None
     image_output_format: Literal["png", "jpg"] = "png"
 
 
@@ -528,7 +672,7 @@ class GenerateRequest(BaseModel):
         "21:9",
         "auto",
     ] = "1:1"
-    image_resolution: Literal["1K", "2K", "4K"] = "1K"
+    image_resolution: Literal["1K", "2K", "4K"] | None = None
     image_output_format: Literal["png", "jpg"] = "png"
     video_aspect_ratio: Literal["portrait", "landscape"] = "portrait"
     video_n_frames: Literal["10", "15"] = "10"
@@ -541,6 +685,105 @@ class ReviewRequest(BaseModel):
     asset_id: str
     action: ReviewAction
     reason: str | None = None
+
+
+class UserRecord(BaseModel):
+    username: str
+    email: str
+    display_name: str
+    workspace_id: str = "default_workspace"
+    role: UserRole = UserRole.member
+    account_status: AccountStatus = AccountStatus.active
+    is_active: bool = True
+    points_balance: int = 0
+    created_at: datetime
+    updated_at: datetime
+    last_login_at: datetime | None = None
+
+
+class UserCreateRequest(BaseModel):
+    username: str = Field(..., min_length=2, max_length=40)
+    password: str = Field(..., min_length=6, max_length=80)
+    email: str | None = Field(default=None, max_length=120)
+    display_name: str | None = Field(default=None, max_length=80)
+    workspace_id: str | None = Field(default=None, max_length=80)
+    role: UserRole = UserRole.member
+    account_status: AccountStatus = AccountStatus.active
+    is_active: bool = True
+    initial_points: int = Field(default=0, ge=0, le=1_000_000)
+
+
+class UserUpdateRequest(BaseModel):
+    display_name: str | None = Field(default=None, max_length=80)
+    workspace_id: str | None = Field(default=None, max_length=80)
+    role: UserRole | None = None
+    account_status: AccountStatus | None = None
+    is_active: bool | None = None
+    password: str | None = Field(default=None, min_length=6, max_length=80)
+
+
+class UserRegisterRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=40)
+    password: str = Field(..., min_length=8, max_length=80)
+    email: str = Field(..., min_length=6, max_length=120)
+    display_name: str | None = Field(default=None, max_length=80)
+    invite_code: str | None = Field(default=None, max_length=80)
+
+
+class RechargeCreateRequest(BaseModel):
+    points: int = Field(..., ge=1, le=100_000)
+    amount_cny: float = Field(..., gt=0, le=100_000)
+    channel: str = Field(default="manual", max_length=40)
+    note: str | None = Field(default=None, max_length=200)
+
+
+class RechargeConfirmRequest(BaseModel):
+    order_id: str
+
+
+class ManualAdjustPointsRequest(BaseModel):
+    username: str
+    delta: int = Field(..., ge=-100_000, le=100_000)
+    note: str | None = Field(default=None, max_length=200)
+
+
+class RechargeOrder(BaseModel):
+    order_id: str
+    username: str
+    points: int
+    amount_cny: float
+    channel: str
+    status: RechargeStatus = RechargeStatus.pending
+    created_at: datetime
+    updated_at: datetime
+    paid_at: datetime | None = None
+    note: str | None = None
+    operator: str | None = None
+
+
+class PointsLedgerEntry(BaseModel):
+    ledger_id: str
+    username: str
+    delta: int
+    balance_after: int
+    kind: LedgerKind
+    note: str | None = None
+    project_id: str | None = None
+    asset_id: str | None = None
+    created_at: datetime
+
+
+class BillingSummary(BaseModel):
+    username: str
+    balance: int
+    today_income: int = 0
+    today_cost: int = 0
+    pending_recharge_count: int = 0
+
+
+class ShareAssetRequest(BaseModel):
+    asset_id: str
+    shared: bool = True
 
 
 class RenderRequest(BaseModel):
@@ -615,10 +858,33 @@ class ProjectProgress(BaseModel):
     render_total: int = 0
     render_failed: int = 0
     render_running: int = 0
+    selected_final_count: int = 0
+    required_final_count: int = 0
+    candidate_total: int = 0
+    batch_done: int = 0
+    batch_failed: int = 0
     progress_percent_weighted: int = Field(default=0, ge=0, le=100)
     progress_profile: Literal["image_weighted", "video_weighted"] = "image_weighted"
     step_weights: dict[str, int] = Field(default_factory=dict)
     completion_criteria: str = ""
+
+
+class OssSignRequest(BaseModel):
+    project_id: str
+    filename: str
+    content_type: str | None = None
+    role: str = "source"
+    size: int | None = None
+
+
+class OssSignResponse(BaseModel):
+    upload_url: str
+    access_id: str
+    policy: str
+    signature: str
+    key: str
+    expire_at: int
+    public_url: str
     updated_at: datetime
     render_id: str | None = None
 
@@ -633,8 +899,13 @@ class BatchCreateProjectResponse(BaseModel):
 
 class BatchCreateModelRetouchResponse(BaseModel):
     batch_group_id: str
+    controller_project_id: str | None = None
     project_ids: list[str] = Field(default_factory=list)
     created_count: int = 0
+    total_images: int = 0
+    done_images: int = 0
+    failed_images: int = 0
+    queued_images: int = 0
     projects: list[ProjectRecord] = Field(default_factory=list)
 
 
@@ -654,6 +925,71 @@ class ReviewResponse(BaseModel):
     decision: ReviewDecision
 
 
+class ShareAssetResponse(BaseModel):
+    project: ProjectRecord
+    asset: AssetRecord
+    awarded_points: int = 0
+    total_points: int = 0
+
+
+class ShowcaseRemixRequest(BaseModel):
+    asset_id: str
+    product_name: str | None = Field(default=None, max_length=80)
+    template_name: str | None = Field(default=None, max_length=40)
+
+
+class ShowcaseRemixResponse(BaseModel):
+    source_asset_id: str
+    source_project_id: str
+    project: ProjectRecord
+
+
+class QualitySummaryItem(BaseModel):
+    tool_type: ToolType
+    total_reports: int = 0
+    passed_reports: int = 0
+    pass_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    avg_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    avg_clarity: float = Field(default=0.0, ge=0.0, le=1.0)
+    avg_consistency: float = Field(default=0.0, ge=0.0, le=1.0)
+    avg_compliance: float = Field(default=0.0, ge=0.0, le=1.0)
+    top_issues: list[str] = Field(default_factory=list)
+
+
+class QualitySummaryResponse(BaseModel):
+    days: int = 7
+    total_reports: int = 0
+    overall_pass_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    items: list[QualitySummaryItem] = Field(default_factory=list)
+
+
+class PromptVersionMetric(BaseModel):
+    tool_type: ToolType
+    prompt_version: str
+    project_count: int = 0
+    generated_assets: int = 0
+    pass_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    avg_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    last_used_at: datetime | None = None
+
+
+class PromptVersionMetricsResponse(BaseModel):
+    days: int = 7
+    items: list[PromptVersionMetric] = Field(default_factory=list)
+
+
+class UserListResponse(BaseModel):
+    items: list[UserRecord] = Field(default_factory=list)
+
+
+class RechargeListResponse(BaseModel):
+    items: list[RechargeOrder] = Field(default_factory=list)
+
+
+class LedgerListResponse(BaseModel):
+    items: list[PointsLedgerEntry] = Field(default_factory=list)
+
+
 class DashboardKpi(BaseModel):
     total_projects: int = 0
     running_projects: int = 0
@@ -662,6 +998,21 @@ class DashboardKpi(BaseModel):
     total_assets: int = 0
     uploaded_assets: int = 0
     generated_assets: int = 0
+    showcase_assets: int = 0
+    share_points_earned: int = 0
+
+
+class ModelRetouchBatchSummaryResponse(BaseModel):
+    batch_group_id: str
+    controller_project_id: str | None = None
+    total_images: int = 0
+    done_images: int = 0
+    failed_images: int = 0
+    running_images: int = 0
+    queued_images: int = 0
+    identity_status: IdentityStatus = IdentityStatus.pending
+    identity_anchor_asset_id: str | None = None
+    projects: list[ProjectRecord] = Field(default_factory=list)
 
 
 class BatchCreateRequest(BaseModel):

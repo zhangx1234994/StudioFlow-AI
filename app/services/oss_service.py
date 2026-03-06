@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hmac
+import json
 import logging
+from datetime import datetime, timezone
+from hashlib import sha1
 from pathlib import Path
+from time import time
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -25,6 +31,7 @@ class OssService:
         self._enabled = False
         self._bucket = None
         self._public_base = ""
+        self._upload_base = ""
         self._prefix = str(settings.oss_root_prefix or "").strip().strip("/")
 
         if not all(
@@ -44,6 +51,7 @@ class OssService:
         endpoint = settings.oss_endpoint or "oss-cn-hangzhou.aliyuncs.com"
         self._bucket = oss2.Bucket(auth, f"https://{endpoint}", settings.oss_bucket)
         self._enabled = True
+        self._upload_base = f"https://{settings.oss_bucket}.{endpoint}"
 
         public_domain = (settings.oss_public_domain or "").strip().rstrip("/")
         if public_domain:
@@ -63,6 +71,41 @@ class OssService:
         if suffix and not raw.endswith(suffix):
             raw = f"{raw}{suffix}"
         return raw
+
+    def sign_post(
+        self,
+        object_key: str,
+        expire_seconds: int = 300,
+        max_size_mb: int = 20,
+    ) -> dict[str, Any]:
+        if not self.enabled:
+            raise RuntimeError("OSS is not enabled")
+        access_key = self._settings.oss_access_key or ""
+        secret_key = self._settings.oss_secret_key or ""
+        if not access_key or not secret_key:
+            raise RuntimeError("OSS credentials missing")
+        expires_at = int(time()) + max(60, expire_seconds)
+        expiration = datetime.fromtimestamp(expires_at, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        policy = {
+            "expiration": expiration,
+            "conditions": [
+                ["eq", "$key", object_key],
+                ["content-length-range", 1, max_size_mb * 1024 * 1024],
+            ],
+        }
+        policy_encoded = base64.b64encode(json.dumps(policy).encode("utf-8")).decode("utf-8")
+        signature = base64.b64encode(
+            hmac.new(secret_key.encode("utf-8"), policy_encoded.encode("utf-8"), sha1).digest()
+        ).decode("utf-8")
+        return {
+            "upload_url": self._upload_base,
+            "access_id": access_key,
+            "policy": policy_encoded,
+            "signature": signature,
+            "key": object_key,
+            "expire_at": expires_at,
+            "public_url": f"{self._public_base}/{object_key}",
+        }
 
     async def upload_file(self, local_path: Path, object_key: str, content_type: str | None = None) -> str:
         if not self.enabled:

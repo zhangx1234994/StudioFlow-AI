@@ -1,4 +1,5 @@
 import os
+import base64
 
 from fastapi.testclient import TestClient
 
@@ -6,6 +7,11 @@ os.environ["MVP_USE_MOCK_PROVIDERS"] = "true"
 os.environ["MVP_AUTH_ENABLED"] = "false"
 
 from app.main import app
+
+PNG_20X20 = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAABQAAAAUCAIAAAAC64paAAAAKUlEQVR4nGP8z0A+YKJAL8Oo"
+    "ZhIBE6kakMGoZhIBE6kakMGoZhIBRZoBIpwBJy3phGMAAAAASUVORK5CYII="
+)
 
 
 def test_app_tools_page_serves_frontend() -> None:
@@ -47,6 +53,30 @@ def test_legacy_tool_routes_redirect_to_new_slug_routes() -> None:
     multi_project = client.get("/tools/multi_angle_camera/projects/demo", follow_redirects=False)
     assert multi_project.status_code == 302
     assert multi_project.headers["location"] == "/app/tools/multi-angle-camera/projects/demo"
+
+
+def test_legacy_model_project_route_redirects_to_batch_workspace() -> None:
+    client = TestClient(app)
+    create_resp = client.post(
+        "/api/v1/tools/model_retouch/batch-create",
+        data={"product_name": "legacy-batch-redirect", "identity_replace": "false"},
+        files=[
+            ("images", ("a.png", PNG_20X20, "image/png")),
+            ("images", ("b.png", PNG_20X20, "image/png")),
+        ],
+    )
+    assert create_resp.status_code == 200
+    payload = create_resp.json()
+    project_id = payload["project_ids"][0]
+    batch_id = payload["batch_group_id"]
+
+    legacy1 = client.get(f"/tools/model_retouch/projects/{project_id}", follow_redirects=False)
+    assert legacy1.status_code == 302
+    assert legacy1.headers["location"] == f"/app/tools/model-retouch/batches/{batch_id}"
+
+    legacy2 = client.get(f"/projects/{project_id}", follow_redirects=False)
+    assert legacy2.status_code == 302
+    assert legacy2.headers["location"] == f"/app/tools/model-retouch/batches/{batch_id}"
 
 
 def test_ui_meta_and_nav_context_endpoints() -> None:

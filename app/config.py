@@ -11,7 +11,8 @@ class Settings(BaseSettings):
 
     volc_api_key: str | None = None
     volc_base_url: str = "https://ark.cn-beijing.volces.com/api/v3/responses"
-    volc_model: str = "doubao-seed-2-0-pro-260215"
+    volc_model: str = "doubao-seed-2-0-mini"
+    volc_disable_thinking: bool = True
 
     kie_api_key: str | None = None
     kie_jobs_base_url: str = "https://api.kie.ai/api/v1/jobs"
@@ -22,7 +23,7 @@ class Settings(BaseSettings):
     kie_image_model: str = "nano-banana-pro"
     kie_image_resolution: str = "1K"
     kie_image_output_format: str = "png"
-    storyboard_concurrency: int = 2
+    storyboard_concurrency: int = 4
 
     ref_image_enabled: bool = False
     ref_image_api_key: str | None = None
@@ -31,6 +32,7 @@ class Settings(BaseSettings):
 
     storage_root: Path = Path("data")
     store_backend: str = "auto"
+    store_async_persist: bool = True
     redis_url: str | None = None
     redis_state_key: str = "photo2video:state"
     allow_background_tasks: bool = True
@@ -42,6 +44,7 @@ class Settings(BaseSettings):
     auth_secret: str = "photo2video-dev-secret"
     auth_session_hours: int = 24
     auth_session_days: int = 7
+    billing_recharge_enabled: bool = False
     supabase_url: str | None = None
     supabase_anon_key: str | None = None
     supabase_service_role_key: str | None = None
@@ -51,6 +54,8 @@ class Settings(BaseSettings):
     local_assembly_enabled: bool = False
     poll_interval_seconds: float = 5.0
     poll_max_attempts: int = 180
+    image_task_timeout_seconds: float = 120.0
+    image_task_retry_attempts: int = 2
     video_task_concurrency: int = 20
     vl_overall_timeout_seconds: float = 45.0
     oss_access_key: str | None = None
@@ -73,6 +78,8 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     settings = Settings()
+    settings.volc_api_key = settings.volc_api_key or os.getenv("ARK_API_KEY")
+    settings.volc_model = settings.volc_model or os.getenv("ARK_MODEL", "doubao-seed-2-0-mini")
     settings.auth_provider = (settings.auth_provider or os.getenv("AUTH_PROVIDER") or "local").strip().lower()
     settings.auth_session_days = int(
         os.getenv("AUTH_SESSION_DAYS", str(settings.auth_session_days or 7))

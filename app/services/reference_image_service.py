@@ -215,7 +215,8 @@ class ReferenceImageService:
                 logger.warning("Reference image upload failed: %s", exc)
         image_input_urls = image_input_urls[:8]
 
-        concurrency = max(1, min(self._settings.storyboard_concurrency, 6))
+        task_count = len(prompts)
+        concurrency = max(1, min(self._settings.storyboard_concurrency, 8, task_count))
         semaphore = asyncio.Semaphore(concurrency)
 
         async def _run(item: PromptItem) -> tuple[str, ShotReference]:
@@ -281,18 +282,38 @@ class ReferenceImageService:
         image_resolution: str | None = None,
         image_output_format: str | None = None,
     ) -> str | None:
-        try:
-            task_id = await self._create_task(
-                image_input_urls=image_input_urls,
-                prompt=prompt,
-                image_aspect_ratio=image_aspect_ratio,
-                image_resolution=image_resolution,
-                image_output_format=image_output_format,
-            )
-            return await self._wait_task_result(task_id)
-        except Exception as exc:  # pragma: no cover - network instability
-            logger.warning("Storyboard image generation failed: %s", exc)
-            return None
+        max_attempts = max(1, min(3, int(self._settings.image_task_retry_attempts or 2)))
+        for attempt in range(1, max_attempts + 1):
+            try:
+                task_id = await self._create_task(
+                    image_input_urls=image_input_urls,
+                    prompt=prompt,
+                    image_aspect_ratio=image_aspect_ratio,
+                    image_resolution=image_resolution,
+                    image_output_format=image_output_format,
+                )
+                image_url = await self._wait_task_result(task_id)
+                if image_url:
+                    return image_url
+                logger.warning(
+                    "Storyboard image generation returned empty result "
+                    "(attempt=%s/%s, task_id=%s)",
+                    attempt,
+                    max_attempts,
+                    task_id,
+                )
+            except Exception as exc:  # pragma: no cover - network instability
+                logger.warning(
+                    "Storyboard image generation failed "
+                    "(attempt=%s/%s, error_type=%s, detail=%r)",
+                    attempt,
+                    max_attempts,
+                    type(exc).__name__,
+                    exc,
+                )
+            if attempt < max_attempts:
+                await asyncio.sleep(float(attempt))
+        return None
 
     async def _create_task(
         self,
@@ -307,21 +328,29 @@ class ReferenceImageService:
             "Authorization": f"Bearer {self._settings.kie_api_key}",
             "Content-Type": "application/json",
         }
+        input_payload: dict[str, Any] = {
+            "prompt": prompt,
+            "image_input": image_input_urls[:8],
+            "aspect_ratio": image_aspect_ratio or "9:16",
+            "output_format": image_output_format or self._settings.kie_image_output_format,
+        }
+        if image_resolution:
+            input_payload["resolution"] = image_resolution
         payload: dict[str, Any] = {
                 "model": self._settings.kie_image_model,
-                "input": {
-                    "prompt": prompt,
-                    "image_input": image_input_urls[:8],
-                    "aspect_ratio": image_aspect_ratio or "9:16",
-                    "resolution": image_resolution or self._settings.kie_image_resolution,
-                    "output_format": image_output_format or self._settings.kie_image_output_format,
-                },
+                "input": input_payload,
         }
 
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(url, headers=headers, json=payload)
-            response.raise_for_status()
-            data = response.json()
+            if response.status_code >= 400:
+                snippet = response.text[:240].replace("\n", " ")
+                raise RuntimeError(f"createTask failed ({response.status_code}): {snippet}")
+            try:
+                data = response.json()
+            except Exception as exc:
+                snippet = response.text[:240].replace("\n", " ")
+                raise RuntimeError(f"createTask invalid JSON response: {snippet}") from exc
 
         task_id = data.get("data", {}).get("taskId")
         if not isinstance(task_id, str):
@@ -331,19 +360,44 @@ class ReferenceImageService:
     async def _wait_task_result(self, task_id: str) -> str | None:
         url = f"{self._settings.kie_jobs_base_url}/recordInfo"
         headers = {"Authorization": f"Bearer {self._settings.kie_api_key}"}
+        poll_interval = max(1.0, float(self._settings.poll_interval_seconds))
+        timeout_seconds = max(20.0, float(self._settings.image_task_timeout_seconds))
+        max_attempts_by_timeout = max(1, int(timeout_seconds // poll_interval))
+        max_attempts = min(self._settings.poll_max_attempts, max_attempts_by_timeout)
 
         async with httpx.AsyncClient(timeout=60.0) as client:
-            for _ in range(self._settings.poll_max_attempts):
+            for _ in range(max_attempts):
                 response = await client.get(url, headers=headers, params={"taskId": task_id})
-                response.raise_for_status()
-                data = response.json()
+                if response.status_code >= 400:
+                    snippet = response.text[:240].replace("\n", " ")
+                    raise RuntimeError(
+                        f"recordInfo failed ({response.status_code}, task_id={task_id}): {snippet}"
+                    )
+                try:
+                    data = response.json()
+                except Exception as exc:
+                    snippet = response.text[:240].replace("\n", " ")
+                    raise RuntimeError(
+                        f"recordInfo invalid JSON (task_id={task_id}): {snippet}"
+                    ) from exc
 
                 state = self._read_task_state(data)
                 if state in {"SUCCESS", "COMPLETED"}:
                     return self._extract_image_url(data)
                 if state in {"FAILED", "CANCELED", "ERROR"}:
+                    logger.warning(
+                        "Storyboard task failed in provider response (task_id=%s, state=%s)",
+                        task_id,
+                        state,
+                    )
                     return None
-                await asyncio.sleep(self._settings.poll_interval_seconds)
+                await asyncio.sleep(poll_interval)
+        logger.warning(
+            "Storyboard task polling timeout (task_id=%s, attempts=%s, timeout_seconds=%s)",
+            task_id,
+            max_attempts,
+            timeout_seconds,
+        )
         return None
 
     def _read_task_state(self, data: dict[str, Any]) -> str:

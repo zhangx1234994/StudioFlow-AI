@@ -1,4 +1,5 @@
 from functools import lru_cache
+import os
 
 from app.config import get_settings
 from app.services.assembly_service import AssemblyService
@@ -17,7 +18,7 @@ def get_store() -> InMemoryStore:
     if backend == "auto":
         if settings.redis_url:
             backend = "redis"
-        elif all(
+        elif os.getenv("VERCEL") and all(
             [
                 settings.oss_access_key,
                 settings.oss_secret_key,
@@ -35,6 +36,7 @@ def get_store() -> InMemoryStore:
         return InMemoryStore(
             redis_url=settings.redis_url,
             redis_state_key=settings.redis_state_key,
+            async_persist=False,
         )
     if backend == "oss":
         if not all(
@@ -56,9 +58,13 @@ def get_store() -> InMemoryStore:
             oss_bucket=settings.oss_bucket,
             oss_endpoint=settings.oss_endpoint,
             oss_state_key=state_key,
+            async_persist=True,
         )
 
-    return InMemoryStore(persist_path=settings.storage_root / "state" / "store.json")
+    return InMemoryStore(
+        persist_path=settings.storage_root / "state" / "store.json",
+        async_persist=settings.store_async_persist,
+    )
 
 
 @lru_cache
